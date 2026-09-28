@@ -1,0 +1,242 @@
+// ============================================
+// RÈGLES DE SÉCURITÉ FIRESTORE - AubeShop
+// ============================================
+// Fichier : firestore.rules
+//
+// Authentification : Tous les utilisateurs doivent être authentifiés (sauf lecture catalogue)
+// Autorisation : Basée sur le rôle (client, vendor, admin)
+// 
+// À déployer dans Firebase Console :
+// 1. Firestore Database > Rules
+// 2. Copier/coller ce contenu
+// 3. Publish
+// ============================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ============================================
+    // FONCTION UTILITAIRES
+    // ============================================
+
+    // Vérifier si l'utilisateur est authentifié
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Vérifier si l'utilisateur est propriétaire du document
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    // Récupérer le rôle d'un utilisateur
+    function getUserRole(userId) {
+      return get(/databases/$(database)/documents/users/$(userId)).data.role;
+    }
+
+    // Vérifier si c'est un vendeur vérifié
+    function isVerifiedVendor(vendorId) {
+      let vendorDoc = get(/databases/$(database)/documents/vendors/$(vendorId));
+      return vendorDoc.data.verificationStatus == 'approved';
+    }
+
+    // Vérifier si c'est un admin
+    function isAdmin() {
+      return getUserRole(request.auth.uid) == 'admin';
+    }
+
+    // ============================================
+    // COLLECTION : users
+    // ============================================
+    match /users/{userId} {
+      // Lecture : Propriétaire peut lire son profil, admin peut tout lire
+      allow read: if isOwner(userId) || isAdmin();
+      
+      // Écriture création : Authenticated user crée son propre compte
+      allow create: if isAuthenticated() && request.auth.uid == userId 
+                    && request.resource.data.role in ['client', 'vendor'];
+      
+      // Écriture mise à jour : Propriétaire peut modifier son profil (sauf le rôle)
+      allow update: if isOwner(userId) && 
+                    (!('role' in request.resource.data) || 
+                     request.resource.data.role == resource.data.role);
+      
+      // Suppression : Admin seulement
+      allow delete: if isAdmin();
+    }
+
+    // ============================================
+    // COLLECTION : vendors
+    // ============================================
+    match /vendors/{vendorId} {
+      // Lecture : Tous les vendeurs approuvés sont lisibles (catalogue), propriétaire voit le sien
+      allow read: if resource.data.verificationStatus == 'approved' || 
+                  isOwner(vendorId) || 
+                  isAdmin();
+      
+      // Écriture création : Étudiant crée sa candidature vendeur
+      allow create: if isAuthenticated() && request.auth.uid == vendorId &&
+                    request.resource.data.verificationStatus == 'pending';
+      
+      // Écriture mise à jour : Vendeur modifie son profil (sauf verificationStatus)
+      allow update: if isOwner(vendorId) &&
+                    (!('verificationStatus' in request.resource.data.diff.delta) &&
+                     !('approvedBy' in request.resource.data.diff.delta));
+      
+      // Mise à jour du statut de vérification : Admin seulement
+      allow update: if isAdmin() && 
+                    ('verificationStatus' in request.resource.data.diff.delta || 
+                     'approvedBy' in request.resource.data.diff.delta);
+      
+      // Suppression : Admin seulement
+      allow delete: if isAdmin();
+    }
+
+    // ============================================
+    // COLLECTION : products
+    // ============================================
+    match /products/{productId} {
+      // Lecture : Tous lisent les produits actifs (catalogue public)
+      allow read: if resource.data.isActive == true;
+      
+      // Lecture privée : Vendeur lit tous ses produits (actifs ou non)
+      allow read: if isAuthenticated() && 
+                  request.auth.uid == resource.data.vendorId;
+      
+      // Écriture création : Vendeur vérifié crée ses produits
+      allow create: if isAuthenticated() && 
+                    request.auth.uid == request.resource.data.vendorId &&
+                    isVerifiedVendor(request.auth.uid);
+      
+      // Écriture mise à jour : Vendeur modifie ses produits
+      allow update: if isAuthenticated() && 
+                    request.auth.uid == resource.data.vendorId &&
+                    request.auth.uid == request.resource.data.vendorId;
+      
+      // Suppression : Vendeur supprime ses produits
+      allow delete: if isAuthenticated() && 
+                    request.auth.uid == resource.data.vendorId;
+    }
+
+    // ============================================
+    // COLLECTION : orders
+    // ============================================
+    match /orders/{orderId} {
+      // Lecture : Client ou Vendeur peuvent voir leurs commandes, admin voit tout
+      allow read: if isAuthenticated() && 
+                  (request.auth.uid == resource.data.clientId || 
+                   request.auth.uid == resource.data.vendorId ||
+                   isAdmin());
+      
+      // Écriture création : Client crée une commande
+      allow create: if isAuthenticated() && 
+                    request.auth.uid == request.resource.data.clientId &&
+                    request.resource.data.status == 'pending' &&
+                    request.resource.data.paymentStatus == 'pending';
+      
+      // Mise à jour par vendeur : Marquer acceptée/en cours/livrée
+      allow update: if isAuthenticated() && 
+                    request.auth.uid == resource.data.vendorId &&
+                    request.resource.data.clientId == resource.data.clientId &&
+                    request.resource.data.vendorId == resource.data.vendorId;
+      
+      // Mise à jour par client : Annulation ou rating après livraison
+      allow update: if isAuthenticated() && 
+                    request.auth.uid == resource.data.clientId &&
+                    (request.resource.data.status == 'cancelled' ||
+                     'rating' in request.resource.data.diff.delta);
+      
+      // Suppression : Admin seulement
+      allow delete: if isAdmin();
+    }
+
+    // ============================================
+    // COLLECTION : cart (Panier - Optionnel)
+    // ============================================
+    match /cart/{userId} {
+      // Lecture/Écriture : Propriétaire du panier
+      allow read, write: if isAuthenticated() && isOwner(userId);
+      
+      // Suppression : Propriétaire après checkout
+      allow delete: if isAuthenticated() && isOwner(userId);
+    }
+
+    // ============================================
+    // COLLECTION : notifications
+    // ============================================
+    match /notifications/{notificationId} {
+      // Lecture : Propriétaire voit ses notifications
+      allow read: if isAuthenticated() && 
+                  request.auth.uid == resource.data.userId;
+      
+      // Écriture création : Cloud Function (serveur) - pas d'auth
+      allow create: if request.auth == null;
+      
+      // Mise à jour : Propriétaire marque comme lu
+      allow update: if isAuthenticated() && 
+                    request.auth.uid == resource.data.userId;
+      
+      // Suppression : Propriétaire
+      allow delete: if isAuthenticated() && 
+                    request.auth.uid == resource.data.userId;
+    }
+
+    // ============================================
+    // COLLECTION : verificationDomains
+    // ============================================
+    match /verificationDomains/{domain} {
+      // Lecture : Tous lisent (publique, config d'app)
+      allow read: if true;
+      
+      // Écriture : Admin seulement
+      allow write: if isAdmin();
+    }
+
+    // ============================================
+    // COLLECTION : adminApprovals
+    // ============================================
+    match /adminApprovals/{approvalId} {
+      // Lecture : Admin + vendeur en attente voit sa demande
+      allow read: if isAdmin() || 
+                  (isAuthenticated() && 
+                   request.auth.uid == resource.data.vendorId);
+      
+      // Écriture création : Vendeur crée sa demande
+      allow create: if isAuthenticated() && 
+                    request.auth.uid == request.resource.data.vendorId &&
+                    request.resource.data.status == 'pending';
+      
+      // Mise à jour : Admin approuve/rejette
+      allow update: if isAdmin();
+      
+      // Suppression : Admin archive
+      allow delete: if isAdmin();
+    }
+
+    // ============================================
+    // COLLECTION : commissions
+    // ============================================
+    match /commissions/{commissionId} {
+      // Lecture : Vendeur voit ses commissions, admin voit tout
+      allow read: if isAuthenticated() && 
+                  (request.auth.uid == resource.data.vendorId || isAdmin());
+      
+      // Écriture création : Cloud Function à la finalisation de commande
+      allow create: if request.auth == null;
+      
+      // Mise à jour statut paiement : Cloud Function
+      allow update: if request.auth == null;
+      
+      // Suppression : Admin
+      allow delete: if isAdmin();
+    }
+
+    // ============================================
+    // CATCH-ALL : Refuse tout le reste
+    // ============================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

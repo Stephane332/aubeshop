@@ -31,7 +31,9 @@ yarn-error.*
 *.pem
 
 # local env files
-.env*.local
+.env
+.env.*
+!.env.example
 
 # typescript
 *.tsbuildinfo
@@ -41,3 +43,10 @@ app-example
 # generated native folders
 /ios
 /android
+
+# JVM crash dumps (Android Studio / Gradle OOM)
+hs_err_pid*.log
+replay_pid*.log
+
+# outils locaux
+.qodo/
