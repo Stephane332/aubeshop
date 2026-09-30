@@ -9,6 +9,7 @@
  * par statut permet de retrouver une commande.
  */
 
+import { useRouter } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
 import { FlatList, Pressable, ScrollView, View } from 'react-native';
 
@@ -30,6 +31,7 @@ const FILTERS: { id: string; label: string; match: (s: OrderStatus) => boolean }
 
 export default function OrdersScreen() {
   const t = useTheme();
+  const router = useRouter();
   const { user, isVendor } = useAuth();
   const perspective = isVendor ? 'vendor' : 'client';
 
@@ -39,7 +41,13 @@ export default function OrdersScreen() {
   const [filter, setFilter] = useState('active');
 
   useEffect(() => {
-    if (!user) return;
+    // Visiteur non connecté : rien à charger, et surtout pas d'attente
+    // infinie sur un écran de chargement.
+    if (!user) {
+      setOrders([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
 
     return watchOrders(
@@ -121,6 +129,20 @@ export default function OrdersScreen() {
       </ScrollView>
     </View>
   );
+
+  if (!user) {
+    return (
+      <Screen>
+        <EmptyState
+          icon="receipt-outline"
+          title="Suivez vos commandes ici"
+          message="Connectez-vous pour retrouver vos achats et suivre vos livraisons en direct."
+          actionLabel="Se connecter"
+          onAction={() => router.push('/auth/login')}
+        />
+      </Screen>
+    );
+  }
 
   if (loading) {
     return (

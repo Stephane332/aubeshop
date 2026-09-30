@@ -100,6 +100,15 @@ export async function placeOrder(
     const snapshots = await Promise.all(productRefs.map((ref) => transaction.get(ref)));
 
     const stockByProduct = new Map<string, number>();
+    /**
+     * Prix lus en base, indexés par produit.
+     *
+     * On ne réécrit pas `line.unitPrice` : les lignes appartiennent à
+     * l'état React du panier, les muter ici reviendrait à modifier l'état
+     * en dehors de son propriétaire.
+     */
+    const priceByProduct = new Map<string, number>();
+
     snapshots.forEach((snap, index) => {
       const line = allLines[index];
       if (!snap.exists()) {
@@ -117,29 +126,31 @@ export async function placeOrder(
             : `Il ne reste que ${available} × « ${line.title} ».`
         );
       }
+      stockByProduct.set(line.productId, available);
       // Le prix facturé est celui de la base, jamais celui envoyé par le
       // client : c'est ce qui empêche de forcer un total à 0.
-      stockByProduct.set(line.productId, available);
-      line.unitPrice = toAmount(product.price);
+      priceByProduct.set(line.productId, toAmount(product.price));
     });
 
     // --- Phase d'écriture -------------------------------------------------
     const createdIds: string[] = [];
 
     for (const group of groups) {
-      const pricing = priceBreakdown(
-        group.lines.map((l) => ({ price: l.unitPrice, quantity: l.quantity })),
-        { method: input.shippingMethod, zone: input.address?.zone }
-      );
-
-      const orderRef = doc(collection(firestore, 'orders'));
+      // Copie figée de la commande, aux prix relus en base.
       const lines: OrderLine[] = group.lines.map((l) => ({
         productId: l.productId,
         title: l.title,
         image: l.image,
-        unitPrice: l.unitPrice,
+        unitPrice: priceByProduct.get(l.productId) ?? toAmount(l.unitPrice),
         quantity: l.quantity,
       }));
+
+      const pricing = priceBreakdown(
+        lines.map((l) => ({ price: l.unitPrice, quantity: l.quantity })),
+        { method: input.shippingMethod, zone: input.address?.zone }
+      );
+
+      const orderRef = doc(collection(firestore, 'orders'));
 
       const order: Omit<Order, 'id'> = {
         groupId,

@@ -24,7 +24,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import 'react-native-reanimated';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
-import { SetupRequired } from '@/components/SetupRequired';
+import { SetupBanner } from '@/components/SetupBanner';
 import { ToastProvider } from '@/components/ui';
 import { Colors } from '@/constants/theme';
 import { AuthProvider, useAuth } from '@/context/AuthContext';
@@ -35,10 +35,17 @@ import { isFirebaseConfigured } from '@/lib/firebase.config';
 export const unstable_settings = { anchor: '(tabs)' };
 
 /**
- * Routes accessibles sans compte : la découverte du catalogue doit rester
- * ouverte, tout le reste demande une session.
+ * Routes accessibles sans compte.
+ *
+ * La découverte doit rester ouverte : on n'exige pas de créer un compte
+ * pour regarder ce qui se vend sur le campus. Le groupe d'onglets en fait
+ * donc partie, et chaque écran qui a besoin d'une session le demande
+ * lui-même (le panier invite à se connecter au moment de commander).
+ *
+ * Tout le reste — paiement, commandes, candidatures, administration —
+ * exige une session.
  */
-const PUBLIC_SEGMENTS = new Set(['auth', 'product']);
+const PUBLIC_SEGMENTS = new Set(['(tabs)', 'auth', 'product']);
 
 function Gate() {
   const { isAuthenticated, initializing } = useAuth();
@@ -104,9 +111,10 @@ function Navigation() {
   return (
     <ThemeProvider value={navTheme}>
       <View style={{ flex: 1, backgroundColor: t.colors.background }}>
-        {/* Sans projet Firebase relié, rien ne peut fonctionner : on
-            l'explique plutôt que de laisser une page blanche. */}
-        {isFirebaseConfigured ? <Gate /> : <SetupRequired />}
+        <Gate />
+        {/* Sans projet Firebase relié, l'app reste navigable : on prévient
+            par un bandeau plutôt que de bloquer sur une page blanche. */}
+        {!isFirebaseConfigured && <SetupBanner />}
       </View>
       <StatusBar style={t.isDark ? 'light' : 'dark'} />
     </ThemeProvider>
