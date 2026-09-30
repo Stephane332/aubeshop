@@ -9,6 +9,11 @@ dist/
 web-build/
 expo-env.d.ts
 
+# Artefacts de build (APK, bundles) — régénérables via npm run apk
+build/
+*.apk
+*.aab
+
 # Native
 .kotlin/
 *.orig.*

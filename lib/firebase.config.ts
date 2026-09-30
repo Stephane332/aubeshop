@@ -50,8 +50,25 @@ export const isFirebaseConfigured =
   !!firebaseConfig.projectId &&
   firebaseConfig.apiKey !== 'YOUR_API_KEY_HERE';
 
+/**
+ * Sans configuration valable, on initialise tout de même le SDK avec des
+ * valeurs factices. Les appels échoueront, mais l'import ne lèvera pas :
+ * l'app peut ainsi démarrer et afficher un écran d'explication au lieu
+ * d'une page blanche.
+ */
+const effectiveConfig = isFirebaseConfigured
+  ? firebaseConfig
+  : {
+      apiKey: 'unconfigured',
+      authDomain: 'unconfigured.firebaseapp.com',
+      projectId: 'unconfigured',
+      storageBucket: 'unconfigured.appspot.com',
+      messagingSenderId: '000000000000',
+      appId: '1:000000000000:web:0000000000000000000000',
+    };
+
 // `getApps()` évite la double initialisation lors du rafraîchissement à chaud.
-const app: FirebaseApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
+const app: FirebaseApp = getApps().length ? getApp() : initializeApp(effectiveConfig);
 
 /**
  * Sur le web, `getAuth` utilise déjà le stockage local du navigateur.

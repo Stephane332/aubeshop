@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "aubeshop-pwa",
+      "//": "Sert l'export statique déjà construit (npm run build:web). Bien plus léger que le serveur de développement, qui sature la mémoire de Node sur cette machine.",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scripts/serve-pwa.js", "8080"],
+      "port": 8080
+    }
+  ]
+}

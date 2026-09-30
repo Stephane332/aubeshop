@@ -24,11 +24,13 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import 'react-native-reanimated';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
+import { SetupRequired } from '@/components/SetupRequired';
 import { ToastProvider } from '@/components/ui';
 import { Colors } from '@/constants/theme';
 import { AuthProvider, useAuth } from '@/context/AuthContext';
 import { CartProvider } from '@/context/CartContext';
 import { useTheme } from '@/hooks/use-theme';
+import { isFirebaseConfigured } from '@/lib/firebase.config';
 
 export const unstable_settings = { anchor: '(tabs)' };
 
@@ -102,7 +104,9 @@ function Navigation() {
   return (
     <ThemeProvider value={navTheme}>
       <View style={{ flex: 1, backgroundColor: t.colors.background }}>
-        <Gate />
+        {/* Sans projet Firebase relié, rien ne peut fonctionner : on
+            l'explique plutôt que de laisser une page blanche. */}
+        {isFirebaseConfigured ? <Gate /> : <SetupRequired />}
       </View>
       <StatusBar style={t.isDark ? 'light' : 'dark'} />
     </ThemeProvider>

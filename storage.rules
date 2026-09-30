@@ -1,0 +1,66 @@
+rules_version = '2';
+
+// ============================================================
+// RÈGLES FIREBASE STORAGE — AubeShop
+// ============================================================
+//
+// Fichier absent de la v1, alors qu'elle prévoyait des photos de produits
+// et des cartes d'étudiant. Sans règles, Storage refuse tout (ou, pire,
+// accepte tout si le projet est resté en mode test).
+//
+// Deux espaces aux exigences opposées :
+// - `products/` est public en lecture : c'est le catalogue.
+// - `applications/` ne l'est pas : une carte d'étudiant ou une pièce
+//   d'identité ne doit être lisible que par son propriétaire et par
+//   l'administration.
+// ============================================================
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+             && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    /** Image raisonnable : type correct et poids plafonné. */
+    function isValidImage() {
+      return request.resource.contentType.matches('image/.*')
+             && request.resource.size <= 5 * 1024 * 1024;
+    }
+
+    // Photos de produits — visibles par tous, écrites par leur vendeur.
+    match /products/{vendorId}/{fileName} {
+      allow read: if true;
+      allow write: if isSignedIn()
+                   && request.auth.uid == vendorId
+                   && isValidImage();
+    }
+
+    // Justificatifs de candidature — pièces d'identité et cartes
+    // d'étudiant. Jamais publics.
+    match /applications/{uid}/{fileName} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isAdmin());
+      allow write: if isSignedIn()
+                   && request.auth.uid == uid
+                   && isValidImage();
+      // Conservés comme preuve de la vérification effectuée.
+      allow delete: if isAdmin();
+    }
+
+    // Avatars et logos de boutique.
+    match /avatars/{uid}/{fileName} {
+      allow read: if true;
+      allow write: if isSignedIn() && request.auth.uid == uid && isValidImage();
+    }
+
+    // Tout le reste est refusé.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

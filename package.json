@@ -3,12 +3,18 @@
   "main": "expo-router/entry",
   "version": "1.0.0",
   "scripts": {
-    "start": "expo start",
-    "reset-project": "node ./scripts/reset-project.js",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "web": "expo start --web",
-    "lint": "expo lint"
+    "//": "NODE_OPTIONS relève le tas de Node à 4 Go : le bundle fait plus de 2200 modules et la limite de 2 Go par défaut provoque un « heap out of memory » sur une machine modeste.",
+    "start": "cross-env NODE_OPTIONS=--max-old-space-size=4096 expo start",
+    "android": "cross-env NODE_OPTIONS=--max-old-space-size=4096 expo start --android",
+    "ios": "cross-env NODE_OPTIONS=--max-old-space-size=4096 expo start --ios",
+    "web": "cross-env NODE_OPTIONS=--max-old-space-size=4096 expo start --web",
+    "build:web": "cross-env NODE_OPTIONS=--max-old-space-size=4096 expo export --platform web --output-dir dist",
+    "serve:web": "node scripts/serve-pwa.js",
+    "icons": "node scripts/generate-icons.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "expo lint",
+    "apk": "cross-env NODE_OPTIONS=--max-old-space-size=4096 node scripts/build-apk.js",
+    "reset-project": "node ./scripts/reset-project.js"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
@@ -44,6 +50,7 @@
   },
   "devDependencies": {
     "@types/react": "~19.1.0",
+    "cross-env": "^10.1.0",
     "eslint": "^9.25.0",
     "eslint-config-expo": "~10.0.0",
     "typescript": "~5.9.2"
