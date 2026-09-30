@@ -212,11 +212,24 @@ service cloud.firestore {
                     && isPositiveInt(request.resource.data.stock)
                     && !changed().hasAny(['rating', 'reviewCount', 'createdAt']);
 
-      // Décrément du stock à la commande : réservé au client qui achète,
-      // et uniquement à la baisse pour `stock`.
+      // Mouvement de stock, écrit par le client au moment de commander
+      // (et en sens inverse à l'annulation).
+      //
+      // Limite assumée : sans Cloud Function, c'est l'application cliente
+      // qui décrémente le stock, donc ces règles ne peuvent pas vérifier
+      // qu'une commande correspondante existe bien. On impose au moins une
+      // invariante : toute unité retirée du stock doit apparaître dans
+      // `soldCount`, et réciproquement. Une manipulation reste possible,
+      // mais elle laisse une trace comptable détectable.
+      //
+      // Le passage à une Cloud Function transactionnelle est la correction
+      // de fond ; elle est notée dans le README.
       allow update: if isActive()
                     && onlyChanges(['stock', 'soldCount', 'updatedAt'])
-                    && isPositiveInt(request.resource.data.stock);
+                    && isPositiveInt(request.resource.data.stock)
+                    && isPositiveInt(request.resource.data.soldCount)
+                    && (resource.data.stock - request.resource.data.stock)
+                       == (request.resource.data.soldCount - resource.data.soldCount);
 
       allow update: if isAdmin();
 

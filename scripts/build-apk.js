@@ -116,10 +116,17 @@ fs.writeFileSync(
 // 4. COMPILATION
 // ============================================
 
-const gradlew = process.platform === 'win32' ? 'gradlew.bat' : './gradlew';
+// Chemin absolu : sous Windows, `gradlew.bat` seul n'est pas résolu
+// puisque le répertoire courant n'est pas dans le PATH.
+const gradlew = path.join(ANDROID, process.platform === 'win32' ? 'gradlew.bat' : 'gradlew');
+
+if (!fs.existsSync(gradlew)) {
+  console.error(`\nWrapper Gradle introuvable : ${gradlew}`);
+  process.exit(1);
+}
 
 try {
-  run(`${gradlew} assembleRelease --no-daemon --max-workers=2`, { cwd: ANDROID });
+  run(`"${gradlew}" assembleRelease --no-daemon --max-workers=2`, { cwd: ANDROID });
 } catch {
   console.error(
     '\nLa compilation a échoué.\n' +

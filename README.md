@@ -158,8 +158,9 @@ firestore.indexes.json
 
 ## État
 
-Le socle est complet et compile sans erreur. Restent à faire :
+Le socle est complet, compile sans erreur et passe le linter. Restent à faire :
 
+- **Cloud Functions** — c'est la limite principale de l'architecture actuelle. Le stock est décrémenté par le client au moment de la commande ; les règles Firestore imposent que toute unité retirée du stock apparaisse dans `soldCount`, mais elles ne peuvent pas vérifier qu'une commande correspondante existe. Déplacer la création de commande dans une fonction serveur fermerait ce point et permettrait la validation automatique des emails universitaires.
 - **Paiement en ligne** — Mobile Money et carte via Flutterwave. Seul le paiement à la livraison est actif.
 - **Notifications push** — les notifications sont pour l'instant internes à l'application.
 - **Reversement des commissions** — les écritures sont enregistrées, le règlement aux vendeurs est manuel.
