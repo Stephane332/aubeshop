@@ -1,16 +1,17 @@
+/**
+ * app/auth/_layout.tsx
+ * ====================
+ * Pile d'authentification : connexion, inscription, mot de passe oublié.
+ */
+
 import { Stack } from 'expo-router';
 
 export default function AuthLayout() {
   return (
-    <Stack
-      screenOptions={{
-        headerShown: false,
-        gestureEnabled: true,
-      }}
-    >
+    <Stack screenOptions={{ headerShown: false, animation: 'slide_from_right' }}>
       <Stack.Screen name="login" />
       <Stack.Screen name="signup" />
-      <Stack.Screen name="vendor-signup" />
+      <Stack.Screen name="forgot-password" options={{ presentation: 'modal' }} />
     </Stack>
   );
 }

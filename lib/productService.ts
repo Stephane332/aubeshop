@@ -1,304 +1,306 @@
 /**
  * lib/productService.ts
  * =====================
- * Service pour gérer les produits
- * CRUD produits, catalogue, recherche
- * Commentaires en français
+ * Catalogue et gestion des produits.
+ *
+ * Corrections par rapport à la v1 :
+ * - les erreurs remontent au lieu d'être avalées en `return []`, ce qui
+ *   faisait afficher « aucun résultat » sur une panne réseau ou un index
+ *   manquant ;
+ * - `stock` est un entier, plus un objet qu'une mise à jour partielle
+ *   écrasait silencieusement ;
+ * - la recherche s'appuie sur un tableau de mots-clés indexé, au lieu de
+ *   télécharger 100 documents pour les filtrer sur le téléphone.
  */
 
 import {
-    addDoc,
-    collection,
-    doc,
-    getDoc,
-    getDocs,
-    limit,
-    orderBy,
-    query,
-    startAfter,
-    updateDoc,
-    where
+  addDoc,
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  limit as fsLimit,
+  onSnapshot,
+  orderBy,
+  query,
+  startAfter,
+  updateDoc,
+  where,
+  type QueryConstraint,
+  type QueryDocumentSnapshot,
 } from 'firebase/firestore';
-import { CatalogOptions, Product, ProductCategory, ProductInput } from '../types/index';
+
+import type {
+  CatalogFilters,
+  Page,
+  Product,
+  ProductDraft,
+  VendorProfile,
+} from '@/types';
+import { stripUndefined } from './authService';
 import { firestore } from './firebase.config';
+import { toAmount } from './money';
+import { uploadImages } from './uploadService';
+
+const PAGE_SIZE = 20;
+
+// ============================================
+// RECHERCHE
+// ============================================
 
 /**
- * ProductService - Service pour gestion des produits
+ * Découpe un titre en mots-clés interrogeables.
+ *
+ * Firestore ne sait pas faire de recherche plein texte : on pré-calcule les
+ * termes à l'écriture pour pouvoir utiliser `array-contains` à la lecture.
+ * Les accents sont retirés afin que « electronique » trouve « électronique ».
  */
-export class ProductService {
-  /**
-   * Créer un produit (Vendeur seulement)
-   * @param vendorId - ID du vendeur
-   * @param productData - Données du produit
-   * @returns { productId }
-   */
-  static async createProduct(
-    vendorId: string,
-    productData: ProductInput
-  ): Promise<{ productId: string }> {
-    try {
-      // 1. Valider données
-      if (!productData.title || productData.price < 0 || productData.stock < 0) {
-        throw new Error('Données produit invalides');
-      }
+export function buildKeywords(...parts: string[]): string[] {
+  const words = parts
+    .join(' ')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 2);
 
-      // 2. Créer document Firestore
-      const newProduct = {
-        vendorId,
-        title: productData.title,
-        description: productData.description,
-        price: productData.price,
-        currency: 'EUR',
-        category: productData.category,
-        stock: {
-          total: productData.stock,
-          available: productData.stock,
-          reserved: 0,
-        },
-        images: productData.images.map((url, index) => ({
-          url,
-          order: index + 1,
-          uploadedAt: Date.now(),
-        })),
-        rating: 0,
-        reviews: 0,
-        tags: productData.tags || [],
-        isActive: true,
-        isFeatured: false,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        lastModifiedBy: vendorId,
-      };
-
-      const productsRef = collection(firestore, 'products');
-      const docRef = await addDoc(productsRef, newProduct);
-
-      console.log('✅ Produit créé:', docRef.id);
-      return { productId: docRef.id };
-    } catch (error: any) {
-      console.error('❌ Erreur création produit:', error);
-      throw new Error('Impossible de créer le produit: ' + error.message);
-    }
-  }
-
-  /**
-   * Récupérer le catalogue avec filtres et pagination
-   * @param options - Options de filtrage/pagination
-   * @returns { products, hasMore, lastDoc }
-   */
-  static async getCatalog(options: CatalogOptions = {}) {
-    try {
-      let q = query(
-        collection(firestore, 'products'),
-        where('isActive', '==', true)
-      );
-
-      // Appliquer filtres
-      if (options.category) {
-        q = query(q, where('category', '==', options.category));
-      }
-
-      // Appliquer tri
-      if (options.sortBy === 'price-asc') {
-        q = query(q, orderBy('price', 'asc'));
-      } else if (options.sortBy === 'price-desc') {
-        q = query(q, orderBy('price', 'desc'));
-      } else if (options.sortBy === 'rating') {
-        q = query(q, orderBy('rating', 'desc'));
-      } else {
-        // Défaut: plus récents d'abord
-        q = query(q, orderBy('createdAt', 'desc'));
-      }
-
-      // Appliquer pagination
-      const pageSize = options.pageSize || 20;
-      q = query(q, limit(pageSize + 1)); // +1 pour déterminer hasMore
-
-      if (options.startAfter) {
-        q = query(q, startAfter(options.startAfter));
-      }
-
-      // Récupérer documents
-      const snapshot = await getDocs(q);
-      const products = snapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      } as Product));
-
-      // Déterminer s'il y a d'autres pages
-      const hasMore = products.length > pageSize;
-      if (hasMore) {
-        products.pop(); // Retirer le +1
-      }
-
-      const lastDoc = snapshot.docs[Math.min(pageSize - 1, snapshot.docs.length - 1)] || null;
-
-      return { products, hasMore, lastDoc };
-    } catch (error: any) {
-      console.error('❌ Erreur récupération catalogue:', error);
-      throw new Error('Impossible de charger le catalogue');
-    }
-  }
-
-  /**
-   * Récupérer un produit par ID
-   * @param productId - ID du produit
-   * @returns Product
-   */
-  static async getProduct(productId: string): Promise<Product> {
-    try {
-      const docRef = doc(firestore, 'products', productId);
-      const docSnap = await getDoc(docRef);
-
-      if (!docSnap.exists()) {
-        throw new Error('Produit non trouvé');
-      }
-
-      return { id: docSnap.id, ...docSnap.data() } as Product;
-    } catch (error: any) {
-      console.error('❌ Erreur récupération produit:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Mettre à jour un produit
-   * @param vendorId - ID du vendeur (pour vérifier autorisation)
-   * @param productId - ID du produit
-   * @param updates - Champs à mettre à jour
-   */
-  static async updateProduct(
-    vendorId: string,
-    productId: string,
-    updates: Partial<ProductInput>
-  ): Promise<void> {
-    try {
-      // 1. Vérifier propriété du produit
-      const productRef = doc(firestore, 'products', productId);
-      const productSnap = await getDoc(productRef);
-
-      if (!productSnap.exists()) {
-        throw new Error('Produit non trouvé');
-      }
-
-      if (productSnap.data().vendorId !== vendorId) {
-        throw new Error('Non autorisé: vous n\'êtes pas le propriétaire');
-      }
-
-      // 2. Mettre à jour
-      const updateData = {
-        ...updates,
-        updatedAt: Date.now(),
-        lastModifiedBy: vendorId,
-      };
-
-      await updateDoc(productRef, updateData);
-      console.log('✅ Produit mis à jour');
-    } catch (error: any) {
-      console.error('❌ Erreur mise à jour produit:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Supprimer un produit
-   * @param vendorId - ID du vendeur
-   * @param productId - ID du produit
-   */
-  static async deleteProduct(vendorId: string, productId: string): Promise<void> {
-    try {
-      // 1. Vérifier propriété
-      const productRef = doc(firestore, 'products', productId);
-      const productSnap = await getDoc(productRef);
-
-      if (!productSnap.exists()) {
-        throw new Error('Produit non trouvé');
-      }
-
-      if (productSnap.data().vendorId !== vendorId) {
-        throw new Error('Non autorisé');
-      }
-
-      // 2. Supprimer (soft delete en mettant isActive à false)
-      await updateDoc(productRef, {
-        isActive: false,
-        updatedAt: Date.now(),
-      });
-
-      console.log('✅ Produit supprimé');
-    } catch (error: any) {
-      console.error('❌ Erreur suppression produit:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Récupérer produits d'un vendeur
-   * @param vendorId - ID du vendeur
-   * @returns Product[]
-   */
-  static async getVendorProducts(vendorId: string): Promise<Product[]> {
-    try {
-      const q = query(
-        collection(firestore, 'products'),
-        where('vendorId', '==', vendorId),
-        orderBy('createdAt', 'desc')
-      );
-
-      const snapshot = await getDocs(q);
-      return snapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      } as Product));
-    } catch (error: any) {
-      console.error('❌ Erreur récupération produits vendeur:', error);
-      return [];
-    }
-  }
-
-  /**
-   * Rechercher produits par texte
-   * @param searchQuery - Termes de recherche
-   * @returns Product[]
-   */
-  static async searchProducts(searchQuery: string): Promise<Product[]> {
-    try {
-      // Note: Firestore ne supporte pas bien la recherche texte
-      // En production, utiliser Algolia ou Elasticsearch
-      // Pour le MVP, récupérer tous les produits et filtrer (⚠️ pas optimal)
-
-      const snapshot = await getDocs(
-        query(
-          collection(firestore, 'products'),
-          where('isActive', '==', true),
-          limit(100)
-        )
-      );
-
-      const searchLower = searchQuery.toLowerCase();
-      const filtered = snapshot.docs
-        .map((doc) => ({ id: doc.id, ...doc.data() } as Product))
-        .filter(
-          (p) =>
-            p.title.toLowerCase().includes(searchLower) ||
-            p.description.toLowerCase().includes(searchLower) ||
-            p.tags?.some((tag) => tag.toLowerCase().includes(searchLower))
-        );
-
-      return filtered;
-    } catch (error: any) {
-      console.error('❌ Erreur recherche produits:', error);
-      return [];
-    }
-  }
-
-  /**
-   * Obtenir catégories disponibles
-   * @returns Liste des catégories
-   */
-  static getCategories(): ProductCategory[] {
-    return ['Livres', 'Électronique', 'Mode', 'Objets', 'Services'];
-  }
+  // Limité à 30 termes : Firestore plafonne la taille des index de tableau.
+  return Array.from(new Set(words)).slice(0, 30);
 }
 
-export default ProductService;
+function normalizeSearch(input: string): string {
+  return input
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '');
+}
+
+// ============================================
+// LECTURE DU CATALOGUE
+// ============================================
+
+function catalogConstraints(filters: CatalogFilters): QueryConstraint[] {
+  const constraints: QueryConstraint[] = [where('status', '==', 'active')];
+
+  if (filters.category) constraints.push(where('category', '==', filters.category));
+  if (filters.campus) constraints.push(where('vendorCampus', '==', filters.campus));
+
+  if (filters.search) {
+    const term = normalizeSearch(filters.search);
+    if (term) constraints.push(where('keywords', 'array-contains', term));
+  }
+
+  switch (filters.sort) {
+    case 'price_asc':
+      constraints.push(orderBy('price', 'asc'));
+      break;
+    case 'price_desc':
+      constraints.push(orderBy('price', 'desc'));
+      break;
+    case 'popular':
+      constraints.push(orderBy('soldCount', 'desc'));
+      break;
+    default:
+      constraints.push(orderBy('createdAt', 'desc'));
+  }
+
+  return constraints;
+}
+
+/**
+ * Une page du catalogue.
+ *
+ * @param cursor Dernier document de la page précédente, tel que renvoyé ici.
+ */
+export async function fetchCatalog(
+  filters: CatalogFilters = {},
+  cursor?: unknown
+): Promise<Page<Product>> {
+  const constraints = catalogConstraints(filters);
+  if (cursor) constraints.push(startAfter(cursor as QueryDocumentSnapshot));
+  // On demande un élément de plus que nécessaire pour savoir s'il reste
+  // une page, sans second appel.
+  constraints.push(fsLimit(PAGE_SIZE + 1));
+
+  const snapshot = await getDocs(query(collection(firestore, 'products'), ...constraints));
+  const docs = snapshot.docs;
+  const hasMore = docs.length > PAGE_SIZE;
+  const page = hasMore ? docs.slice(0, PAGE_SIZE) : docs;
+
+  return {
+    items: page.map(toProduct),
+    hasMore,
+    cursor: page.length > 0 ? page[page.length - 1] : null,
+  };
+}
+
+export async function fetchProduct(productId: string): Promise<Product> {
+  const snap = await getDoc(doc(firestore, 'products', productId));
+  if (!snap.exists()) throw new Error("Ce produit n'existe plus.");
+  return toProduct(snap);
+}
+
+/** Produits d'un vendeur, brouillons et masqués compris. */
+export async function fetchVendorProducts(vendorId: string): Promise<Product[]> {
+  const snapshot = await getDocs(
+    query(
+      collection(firestore, 'products'),
+      where('vendorId', '==', vendorId),
+      where('status', 'in', ['active', 'hidden']),
+      orderBy('createdAt', 'desc')
+    )
+  );
+  return snapshot.docs.map(toProduct);
+}
+
+/**
+ * Abonnement temps réel au catalogue d'un vendeur.
+ * Le tableau de bord reflète ainsi une vente sans rafraîchissement manuel.
+ */
+export function watchVendorProducts(
+  vendorId: string,
+  onChange: (products: Product[]) => void,
+  onError: (error: Error) => void
+): () => void {
+  return onSnapshot(
+    query(
+      collection(firestore, 'products'),
+      where('vendorId', '==', vendorId),
+      where('status', 'in', ['active', 'hidden']),
+      orderBy('createdAt', 'desc')
+    ),
+    (snapshot) => onChange(snapshot.docs.map(toProduct)),
+    onError
+  );
+}
+
+// ============================================
+// ÉCRITURE
+// ============================================
+
+/** Crée un produit. Les images partent vers Storage au préalable. */
+export async function createProduct(
+  vendor: VendorProfile,
+  draft: ProductDraft
+): Promise<string> {
+  validateDraft(draft);
+
+  const images = await uploadImages(draft.images, `products/${vendor.uid}`);
+  const now = Date.now();
+
+  const product: Omit<Product, 'id'> = {
+    vendorId: vendor.uid,
+    vendorName: vendor.storeName,
+    vendorKind: vendor.kind,
+    vendorCampus: vendor.campus,
+    title: draft.title.trim(),
+    description: draft.description.trim(),
+    price: toAmount(draft.price),
+    category: draft.category,
+    images,
+    stock: Math.max(0, Math.trunc(draft.stock)),
+    status: 'active',
+    keywords: buildKeywords(draft.title, draft.description, vendor.storeName),
+    rating: 0,
+    reviewCount: 0,
+    soldCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const ref = await addDoc(collection(firestore, 'products'), stripUndefined(product));
+  return ref.id;
+}
+
+/**
+ * Modifie un produit.
+ *
+ * N'accepte que des champs explicitement autorisés : la v1 étalait un
+ * `Partial<ProductInput>` dans `updateDoc`, si bien qu'envoyer `stock: 5`
+ * remplaçait l'objet de stock par un entier et corrompait le document.
+ */
+export async function updateProduct(
+  vendorId: string,
+  productId: string,
+  draft: ProductDraft
+): Promise<void> {
+  validateDraft(draft);
+
+  const images = await uploadImages(draft.images, `products/${vendorId}`);
+
+  await updateDoc(doc(firestore, 'products', productId), {
+    title: draft.title.trim(),
+    description: draft.description.trim(),
+    price: toAmount(draft.price),
+    category: draft.category,
+    images,
+    stock: Math.max(0, Math.trunc(draft.stock)),
+    keywords: buildKeywords(draft.title, draft.description),
+    updatedAt: Date.now(),
+  });
+}
+
+/** Masque ou réaffiche un produit sans perdre son historique de ventes. */
+export async function setProductVisibility(
+  productId: string,
+  visible: boolean
+): Promise<void> {
+  await updateDoc(doc(firestore, 'products', productId), {
+    status: visible ? 'active' : 'hidden',
+    updatedAt: Date.now(),
+  });
+}
+
+/**
+ * Retire définitivement un produit du catalogue.
+ * Reste un retrait logique : les commandes passées y font référence.
+ */
+export async function removeProduct(productId: string): Promise<void> {
+  await updateDoc(doc(firestore, 'products', productId), {
+    status: 'removed',
+    updatedAt: Date.now(),
+  });
+}
+
+// ============================================
+// OUTILS
+// ============================================
+
+function validateDraft(draft: ProductDraft): void {
+  if (!draft.title.trim()) throw new Error('Le titre est requis.');
+  if (draft.title.trim().length < 3) throw new Error('Le titre est trop court.');
+  if (toAmount(draft.price) <= 0) throw new Error('Indiquez un prix supérieur à 0.');
+  if (draft.stock < 0) throw new Error('Le stock ne peut pas être négatif.');
+  if (draft.images.length === 0) throw new Error('Ajoutez au moins une photo.');
+}
+
+/**
+ * Convertit un document Firestore en `Product` en comblant les champs
+ * manquants. Les documents ne sont pas validés à l'écriture par le SDK : un
+ * ancien document sans `stock` faisait planter la carte produit de la v1 sur
+ * un accès direct à `product.stock.available`.
+ */
+function toProduct(snap: QueryDocumentSnapshot | Awaited<ReturnType<typeof getDoc>>): Product {
+  const data = snap.data() as Partial<Product>;
+  return {
+    id: snap.id,
+    vendorId: data.vendorId ?? '',
+    vendorName: data.vendorName ?? 'Vendeur',
+    vendorKind: data.vendorKind ?? 'student',
+    vendorCampus: data.vendorCampus ?? 'Ouagadougou',
+    title: data.title ?? 'Produit',
+    description: data.description ?? '',
+    price: toAmount(data.price),
+    category: data.category ?? 'other',
+    images: Array.isArray(data.images) ? data.images : [],
+    stock: Math.max(0, Math.trunc(Number(data.stock) || 0)),
+    status: data.status ?? 'active',
+    keywords: Array.isArray(data.keywords) ? data.keywords : [],
+    rating: Number(data.rating) || 0,
+    reviewCount: Number(data.reviewCount) || 0,
+    soldCount: Number(data.soldCount) || 0,
+    createdAt: Number(data.createdAt) || 0,
+    updatedAt: Number(data.updatedAt) || 0,
+  };
+}

@@ -1,165 +1,134 @@
-import { COLORS } from '@/constants/colors';
-import { useAuth } from '@/context/AuthContext';
-import { validateEmail } from '@/lib/utils';
+/**
+ * app/auth/login.tsx
+ * ==================
+ * Connexion.
+ *
+ * Les erreurs s'affichent sous le champ concerné plutôt que dans une
+ * `Alert` modale, et le bouton est verrouillé pendant l'envoi.
+ */
+
 import { useRouter } from 'expo-router';
-import React, { useState } from 'react';
-import {
-    Alert,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
-} from 'react-native';
+import { useState } from 'react';
+import { View } from 'react-native';
+
+import { Button, Input, Screen, Text, useToast } from '@/components/ui';
+import { useAuth } from '@/context/AuthContext';
+import { useTheme } from '@/hooks/use-theme';
+import { isValidEmail } from '@/lib/format';
+import { Logo } from '@/components/Logo';
 
 export default function LoginScreen() {
+  const t = useTheme();
   const router = useRouter();
-  const { login } = useAuth();
+  const toast = useToast();
+  const { signIn, busy } = useAuth();
+
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [errors, setErrors] = useState<{ email?: string; password?: string }>({});
 
-  const handleLogin = async () => {
-    if (!validateEmail(email)) {
-      Alert.alert('Email invalide', 'Vérifiez votre adresse email');
-      return;
-    }
-    if (password.length < 6) {
-      Alert.alert('Mot de passe court', 'Minimum 6 caractères');
-      return;
-    }
+  const submit = async () => {
+    const next: typeof errors = {};
+    if (!isValidEmail(email)) next.email = 'Adresse email invalide.';
+    if (password.length === 0) next.password = 'Saisissez votre mot de passe.';
 
-    setLoading(true);
+    setErrors(next);
+    if (Object.keys(next).length > 0) return;
+
     try {
-      await login(email, password);
-      Alert.alert('✅ Connexion réussie');
-      router.replace('/');
-    } catch (err: any) {
-      Alert.alert('Erreur', err.message || 'Impossible de se connecter');
-    } finally {
-      setLoading(false);
+      await signIn(email, password);
+      // La garde du layout racine redirige vers l'accueil du rôle.
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Connexion impossible.');
     }
   };
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <View style={styles.header}>
-        <Text style={styles.title}>AubeShop</Text>
-        <Text style={styles.subtitle}>Connexion</Text>
-      </View>
+    <Screen scroll edges={['top', 'bottom']}>
+      <View style={{ gap: t.spacing.xl, paddingTop: t.spacing.huge }}>
+        <View style={{ alignItems: 'center', gap: t.spacing.md }}>
+          <Logo size={64} />
+          <View style={{ alignItems: 'center', gap: t.spacing.xxs }}>
+            <Text variant="display">AubeShop</Text>
+            <Text variant="body" tone="muted" center>
+              Achetez et vendez facilement sur le campus.
+            </Text>
+          </View>
+        </View>
 
-      <View style={styles.form}>
-        <Text style={styles.label}>Email</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="votre@email.com"
-          value={email}
-          onChangeText={setEmail}
-          editable={!loading}
-          keyboardType="email-address"
-          autoCapitalize="none"
-        />
+        <View style={{ gap: t.spacing.md }}>
+          <Input
+            label="Email"
+            placeholder="vous@exemple.com"
+            icon="mail-outline"
+            value={email}
+            onChangeText={(v) => {
+              setEmail(v);
+              if (errors.email) setErrors((e) => ({ ...e, email: undefined }));
+            }}
+            error={errors.email}
+            keyboardType="email-address"
+            autoCapitalize="none"
+            autoComplete="email"
+            textContentType="emailAddress"
+          />
 
-        <Text style={styles.label}>Mot de passe</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="••••••••"
-          value={password}
-          onChangeText={setPassword}
-          secureTextEntry
-          editable={!loading}
-        />
+          <Input
+            label="Mot de passe"
+            placeholder="••••••••"
+            icon="lock-closed-outline"
+            revealable
+            value={password}
+            onChangeText={(v) => {
+              setPassword(v);
+              if (errors.password) setErrors((e) => ({ ...e, password: undefined }));
+            }}
+            error={errors.password}
+            autoCapitalize="none"
+            autoComplete="current-password"
+            textContentType="password"
+            onSubmitEditing={submit}
+            returnKeyType="go"
+          />
 
-        <TouchableOpacity
-          style={[styles.button, { opacity: loading ? 0.5 : 1 }]}
-          onPress={handleLogin}
-          disabled={loading}
-        >
-          <Text style={styles.buttonText}>
-            {loading ? '⏳ Connexion...' : '✓ Se connecter'}
+          <Button
+            label="Mot de passe oublié ?"
+            variant="ghost"
+            size="sm"
+            style={{ alignSelf: 'flex-end' }}
+            onPress={() => router.push('/auth/forgot-password')}
+          />
+
+          <Button label="Se connecter" block loading={busy} onPress={submit} />
+        </View>
+
+        <View
+          style={{
+            flexDirection: 'row',
+            justifyContent: 'center',
+            alignItems: 'center',
+            gap: t.spacing.xs,
+          }}>
+          <Text variant="body" tone="muted">
+            Pas encore de compte ?
           </Text>
-        </TouchableOpacity>
-      </View>
+          <Button
+            label="Créer un compte"
+            variant="ghost"
+            size="sm"
+            onPress={() => router.push('/auth/signup')}
+          />
+        </View>
 
-      <View style={styles.footer}>
-        <Text style={styles.footerText}>Pas encore inscrit ? </Text>
-        <TouchableOpacity onPress={() => router.push('/auth/signup')}>
-          <Text style={styles.link}>Créer un compte</Text>
-        </TouchableOpacity>
+        <Button
+          label="Parcourir sans compte"
+          variant="ghost"
+          size="sm"
+          iconAfter="arrow-forward"
+          style={{ alignSelf: 'center' }}
+          onPress={() => router.replace('/')}
+        />
       </View>
-
-      <View style={styles.vendorFooter}>
-        <Text style={styles.footerText}>Vendeur ? </Text>
-        <TouchableOpacity
-          onPress={() => router.push('/auth/vendor-signup')}
-        >
-          <Text style={styles.link}>Inscription vendeur</Text>
-        </TouchableOpacity>
-      </View>
-    </ScrollView>
+    </Screen>
   );
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: COLORS.tertiary },
-  content: { paddingHorizontal: 20, paddingVertical: 30 },
-  header: { alignItems: 'center', marginBottom: 40 },
-  title: {
-    fontSize: 32,
-    fontWeight: 'bold',
-    color: COLORS.primary,
-    marginBottom: 8,
-  },
-  subtitle: {
-    fontSize: 18,
-    color: COLORS.grayDark,
-  },
-  form: { marginBottom: 30 },
-  label: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: COLORS.secondary,
-    marginBottom: 8,
-  },
-  input: {
-    borderWidth: 1,
-    borderColor: COLORS.grayMedium,
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    marginBottom: 16,
-    fontSize: 14,
-    backgroundColor: COLORS.tertiaryLight,
-  },
-  button: {
-    backgroundColor: COLORS.primary,
-    paddingVertical: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-    marginTop: 20,
-  },
-  buttonText: {
-    color: COLORS.tertiary,
-    fontWeight: 'bold',
-    fontSize: 16,
-  },
-  footer: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    marginBottom: 20,
-  },
-  vendorFooter: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-  },
-  footerText: {
-    fontSize: 14,
-    color: COLORS.grayDark,
-  },
-  link: {
-    fontSize: 14,
-    color: COLORS.primary,
-    fontWeight: 'bold',
-  },
-});

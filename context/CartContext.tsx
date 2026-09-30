@@ -1,204 +1,230 @@
 /**
  * context/CartContext.tsx
  * =======================
- * Contexte global du panier
- * Stocké localement en AsyncStorage (pas Firestore pour économiser)
- * Commentaires en français
+ * Panier, persisté localement.
+ *
+ * Trois défauts de la v1 sont corrigés :
+ *
+ * 1. **Le panier était partagé entre comptes.** Une seule clé de stockage
+ *    globale : si deux personnes utilisaient le même téléphone, la seconde
+ *    héritait du panier de la première. La clé dépend désormais de l'`uid`.
+ * 2. **Mutation directe de l'état.** `[...items]` est une copie de surface ;
+ *    la v1 faisait `copie[i].quantity += n`, modifiant l'objet d'origine.
+ *    Avec le compilateur React activé, le rendu pouvait ne pas se déclencher.
+ * 3. **Total désynchronisé.** Il était stocké dans un `useState` alimenté à
+ *    la main. Il est maintenant dérivé, donc toujours juste.
  */
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import React, { createContext, useContext, useEffect, useState } from 'react';
-import { CartContextType, CartItem } from '../types/index';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 
-const CART_STORAGE_KEY = 'aubeshop_cart';
+import { useAuth } from '@/context/AuthContext';
+import type { CartContextValue, CartGroup, CartLine } from '@/types';
 
-/**
- * CartContext - Contexte panier
- */
-const CartContext = createContext<CartContextType | undefined>(undefined);
-
-interface CartProviderProps {
-  children: React.ReactNode;
+/** Clé de stockage propre à un compte (ou à la session anonyme). */
+function storageKey(uid: string | undefined): string {
+  return `aubeshop.cart.${uid ?? 'guest'}`;
 }
 
-/**
- * CartProvider - Fournisseur de contexte panier
- * À enrouler autour de l'app pour donner accès à useCart()
- */
-export function CartProvider({ children }: CartProviderProps) {
-  const [items, setItems] = useState<CartItem[]>([]);
-  const [total, setTotal] = useState(0);
+const CartContext = createContext<CartContextValue | null>(null);
+
+export function CartProvider({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
+  const uid = user?.uid;
+
+  const [lines, setLines] = useState<CartLine[]>([]);
+  const [hydrating, setHydrating] = useState(true);
 
   /**
-   * Charger panier depuis AsyncStorage au démarrage
+   * Clé réellement utilisée pour la dernière écriture. Évite d'enregistrer
+   * le panier d'un compte sous la clé d'un autre pendant la bascule.
    */
-  useEffect(() => {
-    const loadCart = async () => {
-      try {
-        const savedCart = await AsyncStorage.getItem(CART_STORAGE_KEY);
-        if (savedCart) {
-          const parsedCart = JSON.parse(savedCart) as CartItem[];
-          setItems(parsedCart);
-          calculateTotal(parsedCart);
-          console.log('✅ Panier chargé:', parsedCart.length, 'produits');
-        }
-      } catch (error) {
-        console.error('❌ Erreur chargement panier:', error);
-      }
-    };
+  const activeKey = useRef(storageKey(undefined));
 
-    loadCart();
+  // --- Chargement ---------------------------------------------------------
+
+  useEffect(() => {
+    let cancelled = false;
+    const key = storageKey(uid);
+    activeKey.current = key;
+    setHydrating(true);
+
+    void (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(key);
+        if (cancelled) return;
+        const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+        setLines(Array.isArray(parsed) ? parsed.filter(isCartLine) : []);
+      } catch {
+        // Données illisibles : on repart d'un panier vide plutôt que de
+        // planter au démarrage.
+        if (!cancelled) setLines([]);
+      } finally {
+        if (!cancelled) setHydrating(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [uid]);
+
+  // --- Persistance --------------------------------------------------------
+
+  /** Applique un changement et l'enregistre dans la foulée. */
+  const commit = useCallback(async (next: CartLine[]) => {
+    setLines(next);
+    try {
+      await AsyncStorage.setItem(activeKey.current, JSON.stringify(next));
+    } catch {
+      // Le stockage peut être plein ou indisponible ; l'état en mémoire
+      // reste correct pour la session en cours.
+    }
   }, []);
 
-  /**
-   * Calculer le total du panier
-   */
-  const calculateTotal = (cartItems: CartItem[]) => {
-    const sum = cartItems.reduce(
-      (acc, item) => acc + item.price * item.quantity,
-      0
-    );
-    // Arrondir à 2 décimales
-    setTotal(Math.round(sum * 100) / 100);
-  };
+  // --- Actions ------------------------------------------------------------
 
-  /**
-   * Persister panier en AsyncStorage
-   */
-  const persistCart = async (cartItems: CartItem[]) => {
-    try {
-      await AsyncStorage.setItem(CART_STORAGE_KEY, JSON.stringify(cartItems));
-    } catch (error) {
-      console.error('❌ Erreur sauvegarde panier:', error);
-    }
-  };
+  const add = useCallback(
+    async (line: Omit<CartLine, 'quantity'>, quantity = 1) => {
+      const existing = lines.find((l) => l.productId === line.productId);
+      const wanted = (existing?.quantity ?? 0) + Math.max(1, Math.trunc(quantity));
+      // On ne dépasse jamais le stock connu ; il est revalidé au paiement.
+      const capped = Math.min(wanted, Math.max(1, line.maxStock));
 
-  /**
-   * Ajouter produit au panier
-   */
-  const addItem = async (item: CartItem) => {
-    try {
-      // Vérifier si produit existe déjà
-      const existingIndex = items.findIndex((i) => i.productId === item.productId);
+      const next = existing
+        ? lines.map((l) =>
+            l.productId === line.productId ? { ...l, ...line, quantity: capped } : l
+          )
+        : [...lines, { ...line, quantity: capped }];
 
-      let newItems: CartItem[];
+      await commit(next);
+    },
+    [lines, commit]
+  );
 
-      if (existingIndex >= 0) {
-        // Augmenter quantité si déjà dans panier
-        newItems = [...items];
-        newItems[existingIndex].quantity += item.quantity;
-      } else {
-        // Ajouter nouveau produit
-        newItems = [...items, item];
-      }
-
-      setItems(newItems);
-      calculateTotal(newItems);
-      await persistCart(newItems);
-
-      console.log('✅ Produit ajouté au panier');
-    } catch (error) {
-      console.error('❌ Erreur ajout produit:', error);
-    }
-  };
-
-  /**
-   * Retirer produit du panier
-   */
-  const removeItem = async (productId: string) => {
-    try {
-      const newItems = items.filter((i) => i.productId !== productId);
-      setItems(newItems);
-      calculateTotal(newItems);
-      await persistCart(newItems);
-
-      console.log('✅ Produit retiré du panier');
-    } catch (error) {
-      console.error('❌ Erreur retrait produit:', error);
-    }
-  };
-
-  /**
-   * Mettre à jour la quantité d'un produit
-   */
-  const updateQuantity = async (productId: string, quantity: number) => {
-    try {
-      if (quantity <= 0) {
-        // Si quantité ≤ 0, retirer le produit
-        await removeItem(productId);
+  const setQuantity = useCallback(
+    async (productId: string, quantity: number) => {
+      const target = Math.trunc(quantity);
+      if (target <= 0) {
+        await commit(lines.filter((l) => l.productId !== productId));
         return;
       }
-
-      const newItems = items.map((item) =>
-        item.productId === productId ? { ...item, quantity } : item
+      await commit(
+        lines.map((l) =>
+          l.productId === productId
+            ? { ...l, quantity: Math.min(target, Math.max(1, l.maxStock)) }
+            : l
+        )
       );
+    },
+    [lines, commit]
+  );
 
-      setItems(newItems);
-      calculateTotal(newItems);
-      await persistCart(newItems);
+  const remove = useCallback(
+    async (productId: string) => {
+      await commit(lines.filter((l) => l.productId !== productId));
+    },
+    [lines, commit]
+  );
 
-      console.log('✅ Quantité mise à jour');
-    } catch (error) {
-      console.error('❌ Erreur mise à jour quantité:', error);
+  const clear = useCallback(async () => {
+    setLines([]);
+    try {
+      await AsyncStorage.removeItem(activeKey.current);
+    } catch {
+      // Sans conséquence : l'état en mémoire est déjà vide.
     }
-  };
+  }, []);
+
+  const quantityOf = useCallback(
+    (productId: string) => lines.find((l) => l.productId === productId)?.quantity ?? 0,
+    [lines]
+  );
+
+  // --- Valeurs dérivées ---------------------------------------------------
 
   /**
-   * Vider le panier
+   * Regroupement par vendeur : chaque groupe donnera une commande distincte,
+   * et l'écran de paiement peut annoncer « 2 commandes, 2 vendeurs ».
    */
-  const clearCart = async () => {
-    try {
-      setItems([]);
-      setTotal(0);
-      await AsyncStorage.removeItem(CART_STORAGE_KEY);
+  const groups = useMemo<CartGroup[]>(() => {
+    const byVendor = new Map<string, CartGroup>();
 
-      console.log('✅ Panier vidé');
-    } catch (error) {
-      console.error('❌ Erreur vidage panier:', error);
+    for (const line of lines) {
+      const group = byVendor.get(line.vendorId);
+      if (group) {
+        group.lines.push(line);
+        group.subtotal += line.unitPrice * line.quantity;
+      } else {
+        byVendor.set(line.vendorId, {
+          vendorId: line.vendorId,
+          vendorName: line.vendorName,
+          lines: [line],
+          subtotal: line.unitPrice * line.quantity,
+        });
+      }
     }
-  };
 
-  const value: CartContextType = {
-    items,
-    cartItems: items, // Alias pour compatibilité
-    itemCount: items.length,
-    total,
-    addItem,
-    addToCart: (product, quantity) => {
-      const item: CartItem = {
-        productId: product.id,
-        title: product.title,
-        price: product.price,
-        quantity,
-        image: product.images?.[0]?.url || '',
-        vendorId: product.vendorId,
-      };
-      return addItem(item);
-    },
-    removeItem,
-    removeFromCart: removeItem,
-    updateQuantity,
-    clearCart,
-  };
+    return Array.from(byVendor.values());
+  }, [lines]);
 
-  return (
-    <CartContext.Provider value={value}>
-      {children}
-    </CartContext.Provider>
+  /** Somme des quantités — la v1 affichait le nombre de lignes. */
+  const itemCount = useMemo(
+    () => lines.reduce((total, line) => total + line.quantity, 0),
+    [lines]
   );
+
+  const subtotal = useMemo(
+    () => lines.reduce((total, line) => total + line.unitPrice * line.quantity, 0),
+    [lines]
+  );
+
+  const value = useMemo<CartContextValue>(
+    () => ({
+      lines,
+      groups,
+      itemCount,
+      subtotal,
+      hydrating,
+      add,
+      setQuantity,
+      remove,
+      clear,
+      quantityOf,
+    }),
+    [lines, groups, itemCount, subtotal, hydrating, add, setQuantity, remove, clear, quantityOf]
+  );
+
+  return <CartContext.Provider value={value}>{children}</CartContext.Provider>;
 }
 
-/**
- * useCart - Hook pour accéder au contexte panier
- * À utiliser dans n'importe quel composant
- * @returns CartContextType
- */
-export function useCart(): CartContextType {
+export function useCart(): CartContextValue {
   const context = useContext(CartContext);
-  if (!context) {
-    throw new Error('useCart doit être utilisé dans CartProvider');
-  }
+  if (!context) throw new Error('useCart doit être utilisé dans CartProvider');
   return context;
 }
 
-export default CartContext;
+/**
+ * Filtre les entrées corrompues relues depuis le stockage : le format a pu
+ * changer entre deux versions de l'app.
+ */
+function isCartLine(value: unknown): value is CartLine {
+  const line = value as Partial<CartLine>;
+  return (
+    !!line &&
+    typeof line.productId === 'string' &&
+    typeof line.title === 'string' &&
+    typeof line.unitPrice === 'number' &&
+    typeof line.quantity === 'number' &&
+    typeof line.vendorId === 'string'
+  );
+}

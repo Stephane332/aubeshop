@@ -1,333 +1,426 @@
 /**
  * lib/orderService.ts
  * ===================
- * Service pour gérer les commandes
- * Création, statut, historique, etc.
- * Commentaires en français
+ * Cycle de vie des commandes.
+ *
+ * Trois défauts majeurs de la v1 sont corrigés ici :
+ *
+ * 1. **Survente.** Le stock était vérifié par une lecture puis modifié par
+ *    une écriture séparée : deux acheteurs simultanés passaient tous les
+ *    deux. Tout se fait désormais dans une transaction Firestore.
+ * 2. **Panier multi-vendeurs.** La v1 attribuait la commande entière à
+ *    `items[0].vendorId` : le vendeur A recevait les produits du vendeur B,
+ *    et B n'était ni prévenu ni payé. On crée maintenant une commande par
+ *    vendeur, reliées par `groupId`.
+ * 3. **Absence d'atomicité.** Le `writeBatch` de la v1 ne couvrait pas la
+ *    création de la commande ni celle de la commission — un échec laissait
+ *    des données incohérentes.
  */
 
 import {
-    addDoc,
-    collection,
-    doc,
-    getDoc,
-    getDocs,
-    increment,
-    orderBy,
-    query,
-    updateDoc,
-    where,
-    writeBatch,
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  increment,
+  onSnapshot,
+  orderBy,
+  query,
+  runTransaction,
+  where,
+  type QueryDocumentSnapshot,
 } from 'firebase/firestore';
-import { Order, OrderInput } from '../types/index';
-import { firestore } from './firebase.config';
 
-// Commission prélevée par AubeShop (10%)
-const COMMISSION_RATE = 0.10;
-const SHIPPING_COST = 5.0; // EUR
+import type {
+  Address,
+  CartGroup,
+  Commission,
+  Delivery,
+  Order,
+  OrderLine,
+  OrderStatus,
+  PaymentMethod,
+  Product,
+  ShippingMethod,
+  User,
+} from '@/types';
+import { canTransition } from '@/types';
+import { stripUndefined } from './authService';
+import { firestore } from './firebase.config';
+import { priceBreakdown, toAmount } from './money';
+import { notify } from './notificationService';
+
+export interface CheckoutInput {
+  shippingMethod: ShippingMethod;
+  /** Obligatoire en livraison. */
+  address?: Address;
+  /** Obligatoire en retrait. */
+  pickupPoint?: string;
+  paymentMethod: PaymentMethod;
+  clientNote?: string;
+}
+
+// ============================================
+// PASSAGE DE COMMANDE
+// ============================================
 
 /**
- * OrderService - Service pour gestion des commandes
+ * Valide le panier et crée une commande par vendeur.
+ *
+ * Tout est fait dans une seule transaction : soit l'ensemble des stocks est
+ * décrémenté et toutes les commandes sont créées, soit rien ne l'est.
+ *
+ * @returns Les identifiants créés et le `groupId` qui les relie.
  */
-export class OrderService {
-  /**
-   * Créer une commande (Checkout)
-   * @param clientId - ID du client
-   * @param orderInput - Données de la commande
-   * @returns { orderId, total, paymentUrl }
-   */
-  static async createOrder(
-    clientId: string,
-    orderInput: OrderInput
-  ): Promise<{ orderId: string; total: number }> {
-    try {
-      // 1. Valider panier (stocks, produits existent)
-      let subtotal = 0;
-      for (const item of orderInput.items) {
-        const product = await this.getProductForOrder(item.productId);
-        if (!product) {
-          throw new Error(`Produit ${item.productId} n'existe pas`);
-        }
-        if (product.stock.available < item.quantity) {
-          throw new Error(`Stock insuffisant pour ${product.title}`);
-        }
-        subtotal += product.price * item.quantity;
+export async function placeOrder(
+  user: User,
+  groups: CartGroup[],
+  input: CheckoutInput
+): Promise<{ groupId: string; orderIds: string[] }> {
+  if (groups.length === 0) throw new Error('Votre panier est vide.');
+
+  if (input.shippingMethod === 'delivery' && !input.address) {
+    throw new Error('Choisissez une adresse de livraison.');
+  }
+  if (!user.phone && !input.address?.phone) {
+    throw new Error('Un numéro de téléphone est nécessaire pour vous joindre.');
+  }
+
+  const groupId = doc(collection(firestore, 'orderGroups')).id;
+  const now = Date.now();
+  const phone = input.address?.phone ?? user.phone ?? '';
+
+  const orderIds = await runTransaction(firestore, async (transaction) => {
+    const allLines = groups.flatMap((g) => g.lines);
+
+    // --- Phase de lecture -------------------------------------------------
+    // Firestore impose que toutes les lectures précèdent toutes les
+    // écritures dans une transaction.
+    const productRefs = allLines.map((line) => doc(firestore, 'products', line.productId));
+    const snapshots = await Promise.all(productRefs.map((ref) => transaction.get(ref)));
+
+    const stockByProduct = new Map<string, number>();
+    snapshots.forEach((snap, index) => {
+      const line = allLines[index];
+      if (!snap.exists()) {
+        throw new Error(`« ${line.title} » n'est plus disponible.`);
       }
+      const product = snap.data() as Product;
+      if (product.status !== 'active') {
+        throw new Error(`« ${line.title} » n'est plus en vente.`);
+      }
+      const available = Math.max(0, Math.trunc(Number(product.stock) || 0));
+      if (available < line.quantity) {
+        throw new Error(
+          available === 0
+            ? `« ${line.title} » est en rupture de stock.`
+            : `Il ne reste que ${available} × « ${line.title} ».`
+        );
+      }
+      // Le prix facturé est celui de la base, jamais celui envoyé par le
+      // client : c'est ce qui empêche de forcer un total à 0.
+      stockByProduct.set(line.productId, available);
+      line.unitPrice = toAmount(product.price);
+    });
 
-      // 2. Calculer frais
-      const shipping = orderInput.shippingInfo.method === 'delivery' ? SHIPPING_COST : 0;
-      const commission = Math.round(subtotal * COMMISSION_RATE * 100) / 100;
-      const total = subtotal + shipping;
+    // --- Phase d'écriture -------------------------------------------------
+    const createdIds: string[] = [];
 
-      // 3. Déterminer vendeur (supposé unique par commande pour MVP)
-      const vendorId = orderInput.items[0].vendorId;
+    for (const group of groups) {
+      const pricing = priceBreakdown(
+        group.lines.map((l) => ({ price: l.unitPrice, quantity: l.quantity })),
+        { method: input.shippingMethod, zone: input.address?.zone }
+      );
 
-      // 4. Créer document commande
-      const newOrder = {
-        clientId,
-        vendorId,
-        items: orderInput.items,
-        pricing: {
-          subtotal,
-          shipping,
-          commission,
-          tax: 0,
-          total,
-        },
+      const orderRef = doc(collection(firestore, 'orders'));
+      const lines: OrderLine[] = group.lines.map((l) => ({
+        productId: l.productId,
+        title: l.title,
+        image: l.image,
+        unitPrice: l.unitPrice,
+        quantity: l.quantity,
+      }));
+
+      const order: Omit<Order, 'id'> = {
+        groupId,
+        clientId: user.uid,
+        clientName: user.displayName,
+        clientPhone: phone,
+        vendorId: group.vendorId,
+        vendorName: group.vendorName,
+        lines,
+        pricing,
         status: 'pending',
-        paymentStatus: 'pending',
-        shippingInfo: orderInput.shippingInfo,
-        timeline: {
-          createdAt: Date.now(),
-        },
-        notes: orderInput.clientNote ? { clientNote: orderInput.clientNote } : {},
+        paymentStatus: 'unpaid',
+        paymentMethod: input.paymentMethod,
+        shippingMethod: input.shippingMethod,
+        address: input.address,
+        pickupPoint: input.pickupPoint,
+        createdAt: now,
+        timeline: { pending: now },
+        clientNote: input.clientNote?.trim() || undefined,
       };
 
-      const orderRef = await addDoc(collection(firestore, 'orders'), newOrder);
-      const orderId = orderRef.id;
+      transaction.set(orderRef, stripUndefined(order));
+      createdIds.push(orderRef.id);
 
-      // 5. Utiliser batch pour :
-      //    - Décrémenter stocks
-      //    - Créer commission
-      //    - Créer notification
-      const batch = writeBatch(firestore);
-
-      // Décrémenter stocks
-      for (const item of orderInput.items) {
-        const productRef = doc(firestore, 'products', item.productId);
-        batch.update(productRef, {
-          'stock.available': increment(-item.quantity),
-          'stock.reserved': increment(item.quantity),
+      // Décrément du stock, produit par produit.
+      for (const line of group.lines) {
+        const current = stockByProduct.get(line.productId)!;
+        const next = current - line.quantity;
+        stockByProduct.set(line.productId, next);
+        transaction.update(doc(firestore, 'products', line.productId), {
+          stock: next,
+          soldCount: increment(line.quantity),
+          updatedAt: now,
         });
       }
 
-      // Créer commission
-      const commissionRef = await addDoc(collection(firestore, 'commissions'), {
-        vendorId,
-        orderId,
-        amount: commission,
+      // Écriture de commission, dans la même transaction que la commande.
+      const commissionRef = doc(collection(firestore, 'commissions'));
+      const commission: Omit<Commission, 'id'> = {
+        vendorId: group.vendorId,
+        orderId: orderRef.id,
+        amount: pricing.commission,
+        orderSubtotal: pricing.subtotal,
         status: 'pending',
-        paymentMethod: 'pending', // À déterminer après paiement
-        deductedFrom: total,
-        createdAt: Date.now(),
-      });
-
-      // Créer notification vendeur
-      const notifRef = await addDoc(collection(firestore, 'notifications'), {
-        userId: vendorId,
-        type: 'order_created',
-        title: 'Nouvelle commande !',
-        message: `Commande #${orderId} - ${orderInput.items.length} produit(s)`,
-        orderId,
-        isRead: false,
-        createdAt: Date.now(),
-        expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000, // 30 jours
-      });
-
-      await batch.commit();
-
-      console.log('✅ Commande créée:', orderId);
-      return { orderId, total };
-    } catch (error: any) {
-      console.error('❌ Erreur création commande:', error);
-      throw new Error('Impossible de créer la commande: ' + error.message);
-    }
-  }
-
-  /**
-   * Mettre à jour statut d'une commande
-   * @param orderId - ID de la commande
-   * @param newStatus - Nouveau statut
-   * @param actorId - ID de l'utilisateur qui effectue l'action
-   * @param actorRole - Rôle de l'utilisateur ('vendor' ou 'client')
-   */
-  static async updateOrderStatus(
-    orderId: string,
-    newStatus: string,
-    actorId: string,
-    actorRole: string
-  ): Promise<void> {
-    try {
-      // 1. Récupérer commande
-      const orderRef = doc(firestore, 'orders', orderId);
-      const orderSnap = await getDoc(orderRef);
-
-      if (!orderSnap.exists()) {
-        throw new Error('Commande non trouvée');
-      }
-
-      const order = orderSnap.data() as any;
-
-      // 2. Vérifier autorisation
-      if (newStatus === 'accepted' && actorRole !== 'vendor') {
-        throw new Error('Seul le vendeur peut accepter');
-      }
-      if (newStatus === 'cancelled' && actorId !== order.clientId) {
-        throw new Error('Seul le client peut annuler');
-      }
-
-      // 3. Préparer mise à jour
-      const updateData: any = {
-        status: newStatus,
+        createdAt: now,
       };
-
-      // Mettre à jour timeline
-      if (newStatus === 'accepted') {
-        updateData['timeline.acceptedAt'] = Date.now();
-      } else if (newStatus === 'in-progress') {
-        updateData['timeline.inProgressAt'] = Date.now();
-      } else if (newStatus === 'ready') {
-        updateData['timeline.readyAt'] = Date.now();
-      } else if (newStatus === 'delivered') {
-        updateData['timeline.deliveredAt'] = Date.now();
-        updateData['paymentStatus'] = 'paid'; // Paiement simulé OK
-      } else if (newStatus === 'cancelled') {
-        updateData['timeline.cancelledAt'] = Date.now();
-      }
-
-      // 4. Mettre à jour
-      await updateDoc(orderRef, updateData);
-
-      // 5. Créer notification pour l'autre partie
-      const recipient =
-        actorRole === 'vendor' ? order.clientId : order.vendorId;
-      await addDoc(collection(firestore, 'notifications'), {
-        userId: recipient,
-        type: 'order_' + newStatus,
-        title: `Commande #${orderId} - ${newStatus}`,
-        message: `Votre commande a été ${this.getStatusFrench(newStatus)}`,
-        orderId,
-        isRead: false,
-        createdAt: Date.now(),
-        expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
-      });
-
-      console.log('✅ Statut commande mis à jour:', newStatus);
-    } catch (error: any) {
-      console.error('❌ Erreur mise à jour statut:', error);
-      throw error;
+      transaction.set(commissionRef, commission);
     }
-  }
 
-  /**
-   * Récupérer commandes d'un utilisateur
-   * @param userId - ID de l'utilisateur
-   * @param role - Rôle ('client' ou 'vendor')
-   * @returns Order[]
-   */
-  static async getUserOrders(userId: string, role: 'client' | 'vendor'): Promise<Order[]> {
-    try {
-      const field = role === 'client' ? 'clientId' : 'vendorId';
+    return createdIds;
+  });
 
-      const q = query(
-        collection(firestore, 'orders'),
-        where(field, '==', userId),
-        orderBy('timeline.createdAt', 'desc')
-      );
+  // Les notifications sont hors transaction : leur échec ne doit pas annuler
+  // une commande valide.
+  await Promise.allSettled(
+    groups.map((group, index) =>
+      notify({
+        userId: group.vendorId,
+        type: 'order_placed',
+        title: 'Nouvelle commande',
+        body: `${group.lines.length} article(s) — ${group.lines[0].title}`,
+        href: `/order/${orderIds[index]}`,
+      })
+    )
+  );
 
-      const snapshot = await getDocs(q);
-      return snapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      } as Order));
-    } catch (error: any) {
-      console.error('❌ Erreur récupération commandes:', error);
-      return [];
-    }
-  }
-
-  /**
-   * Récupérer détail d'une commande
-   * @param orderId - ID de la commande
-   * @returns Order
-   */
-  static async getOrder(orderId: string): Promise<Order> {
-    try {
-      const orderRef = doc(firestore, 'orders', orderId);
-      const orderSnap = await getDoc(orderRef);
-
-      if (!orderSnap.exists()) {
-        throw new Error('Commande non trouvée');
-      }
-
-      return { id: orderSnap.id, ...orderSnap.data() } as Order;
-    } catch (error: any) {
-      console.error('❌ Erreur récupération commande:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Ajouter note de commande (client)
-   * @param orderId - ID de la commande
-   * @param clientNote - Note du client
-   */
-  static async addOrderNote(orderId: string, clientNote: string): Promise<void> {
-    try {
-      const orderRef = doc(firestore, 'orders', orderId);
-      await updateDoc(orderRef, {
-        'notes.clientNote': clientNote,
-      });
-    } catch (error: any) {
-      console.error('❌ Erreur ajout note:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Évaluer une commande (après livraison)
-   * @param orderId - ID de la commande
-   * @param rating - Note (1-5)
-   * @param comment - Commentaire
-   */
-  static async rateOrder(
-    orderId: string,
-    rating: number,
-    comment: string
-  ): Promise<void> {
-    try {
-      const orderRef = doc(firestore, 'orders', orderId);
-      await updateDoc(orderRef, {
-        rating: Math.min(5, Math.max(1, rating)),
-        'ratingDetails.vendorRating': rating,
-        'ratingDetails.comment': comment,
-        'ratingDetails.ratedAt': Date.now(),
-      });
-
-      console.log('✅ Évaluation enregistrée');
-    } catch (error: any) {
-      console.error('❌ Erreur évaluation:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Helper: récupérer produit pour vérification
-   */
-  private static async getProductForOrder(productId: string) {
-    try {
-      const productRef = doc(firestore, 'products', productId);
-      const productSnap = await getDoc(productRef);
-      return productSnap.data();
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Helper: convertir statut en français
-   */
-  private static getStatusFrench(status: string): string {
-    const statusMap: { [key: string]: string } = {
-      pending: 'en attente',
-      accepted: 'acceptée',
-      'in-progress': 'en cours de préparation',
-      ready: 'prête pour retrait',
-      delivered: 'livrée',
-      cancelled: 'annulée',
-    };
-    return statusMap[status] || status;
-  }
+  return { groupId, orderIds };
 }
 
-export default OrderService;
+// ============================================
+// TRANSITIONS
+// ============================================
+
+/**
+ * Fait avancer une commande.
+ *
+ * La transition est validée contre la machine à états partagée : la v1
+ * acceptait `delivered → pending` et laissait un client annuler après
+ * réception. On vérifie aussi que l'acteur est bien partie prenante, ce que
+ * la v1 déléguait à un paramètre `actorRole` fourni par l'appelant.
+ */
+export async function advanceOrder(
+  orderId: string,
+  to: OrderStatus,
+  actor: { uid: string; role: 'client' | 'vendor' },
+  reason?: string
+): Promise<void> {
+  await runTransaction(firestore, async (transaction) => {
+    const orderRef = doc(firestore, 'orders', orderId);
+    const snap = await transaction.get(orderRef);
+    if (!snap.exists()) throw new Error('Commande introuvable.');
+
+    const order = { id: snap.id, ...snap.data() } as Order;
+
+    const belongs =
+      actor.role === 'client' ? order.clientId === actor.uid : order.vendorId === actor.uid;
+    if (!belongs) throw new Error("Cette commande ne vous concerne pas.");
+
+    if (!canTransition(order.status, to, actor.role)) {
+      throw new Error(
+        `Impossible de passer de « ${order.status} » à « ${to} ».`
+      );
+    }
+
+    const now = Date.now();
+    transaction.update(orderRef, {
+      status: to,
+      [`timeline.${to}`]: now,
+      ...(reason ? { cancelReason: reason } : {}),
+      // Le paiement à la livraison est encaissé à la remise du colis.
+      ...(to === 'completed' && order.paymentMethod === 'cash_on_delivery'
+        ? { paymentStatus: 'paid' }
+        : {}),
+    });
+
+    // Une commande annulée ou refusée rend son stock — la v1 le laissait
+    // réservé indéfiniment.
+    if (to === 'cancelled' || to === 'refused') {
+      for (const line of order.lines) {
+        transaction.update(doc(firestore, 'products', line.productId), {
+          stock: increment(line.quantity),
+          soldCount: increment(-line.quantity),
+          updatedAt: now,
+        });
+      }
+    }
+
+    // Une commande prête et à livrer entre dans le vivier des livreurs.
+    if (to === 'ready' && order.shippingMethod === 'delivery' && order.address) {
+      const delivery: Delivery = {
+        orderId: order.id,
+        groupId: order.groupId,
+        status: 'available',
+        vendorId: order.vendorId,
+        vendorName: order.vendorName,
+        pickupPoint: order.pickupPoint,
+        campus: order.address.city === 'Bobo-Dioulasso' ? 'Bobo-Dioulasso' : 'Ouagadougou',
+        zone: order.address.zone,
+        district: order.address.district,
+        city: order.address.city,
+        fee: order.pricing.shipping,
+        payout: order.pricing.courierPayout,
+        itemCount: order.lines.reduce((n, l) => n + l.quantity, 0),
+        createdAt: now,
+      };
+      transaction.set(doc(firestore, 'deliveries', order.id), stripUndefined(delivery));
+    }
+  });
+
+  await notifyCounterpart(orderId, to);
+}
+
+/** Prévient l'autre partie du changement de statut. */
+async function notifyCounterpart(orderId: string, status: OrderStatus): Promise<void> {
+  const order = await fetchOrder(orderId).catch(() => null);
+  if (!order) return;
+
+  const toVendor = status === 'cancelled';
+  const messages: Partial<Record<OrderStatus, string>> = {
+    accepted: 'Votre commande a été acceptée.',
+    preparing: 'Votre commande est en préparation.',
+    ready: 'Votre commande est prête.',
+    completed: 'Votre commande est terminée. Merci !',
+    refused: 'Votre commande a été refusée par le vendeur.',
+    cancelled: 'Une commande a été annulée par le client.',
+  };
+  const body = messages[status];
+  if (!body) return;
+
+  await notify({
+    userId: toVendor ? order.vendorId : order.clientId,
+    type: `order_${status}` as never,
+    title: `Commande #${orderId.slice(0, 6).toUpperCase()}`,
+    body,
+    href: `/order/${orderId}`,
+  }).catch(() => {});
+}
+
+// ============================================
+// LECTURE
+// ============================================
+
+export async function fetchOrder(orderId: string): Promise<Order> {
+  const snap = await getDoc(doc(firestore, 'orders', orderId));
+  if (!snap.exists()) throw new Error('Commande introuvable.');
+  return { id: snap.id, ...snap.data() } as Order;
+}
+
+/**
+ * Abonnement temps réel aux commandes d'un utilisateur.
+ *
+ * Le cahier des charges promettait un suivi « en temps réel » ; la v1 ne
+ * comptait pas un seul `onSnapshot` et n'actualisait jamais l'écran.
+ */
+export function watchOrders(
+  userId: string,
+  role: 'client' | 'vendor',
+  onChange: (orders: Order[]) => void,
+  onError: (error: Error) => void
+): () => void {
+  const field = role === 'client' ? 'clientId' : 'vendorId';
+  return onSnapshot(
+    query(
+      collection(firestore, 'orders'),
+      where(field, '==', userId),
+      orderBy('createdAt', 'desc')
+    ),
+    (snapshot) => onChange(snapshot.docs.map(toOrder)),
+    onError
+  );
+}
+
+export function watchOrder(
+  orderId: string,
+  onChange: (order: Order) => void,
+  onError: (error: Error) => void
+): () => void {
+  return onSnapshot(
+    doc(firestore, 'orders', orderId),
+    (snap) => {
+      if (snap.exists()) onChange({ id: snap.id, ...snap.data() } as Order);
+      else onError(new Error('Commande introuvable.'));
+    },
+    onError
+  );
+}
+
+/** Commandes d'un vendeur, pour les statistiques du tableau de bord. */
+export async function fetchVendorOrders(vendorId: string): Promise<Order[]> {
+  const snapshot = await getDocs(
+    query(
+      collection(firestore, 'orders'),
+      where('vendorId', '==', vendorId),
+      orderBy('createdAt', 'desc')
+    )
+  );
+  return snapshot.docs.map(toOrder);
+}
+
+// ============================================
+// ÉVALUATION
+// ============================================
+
+/** Note laissée par le client, une fois la commande terminée. */
+export async function reviewOrder(
+  orderId: string,
+  clientUid: string,
+  rating: number,
+  comment?: string
+): Promise<void> {
+  await runTransaction(firestore, async (transaction) => {
+    const orderRef = doc(firestore, 'orders', orderId);
+    const snap = await transaction.get(orderRef);
+    if (!snap.exists()) throw new Error('Commande introuvable.');
+
+    const order = snap.data() as Order;
+    if (order.clientId !== clientUid) throw new Error("Cette commande n'est pas la vôtre.");
+    if (order.status !== 'completed') {
+      throw new Error('Vous pourrez noter une fois la commande terminée.');
+    }
+    if (order.review) throw new Error('Vous avez déjà noté cette commande.');
+
+    transaction.update(orderRef, {
+      review: stripUndefined({
+        rating: Math.min(5, Math.max(1, Math.round(rating))),
+        comment: comment?.trim() || undefined,
+        createdAt: Date.now(),
+      }),
+    });
+  });
+}
+
+// ============================================
+// OUTILS
+// ============================================
+
+function toOrder(snap: QueryDocumentSnapshot): Order {
+  return { id: snap.id, ...snap.data() } as Order;
+}
+
+/** Identifiant court et lisible, affiché à l'utilisateur. */
+export function orderReference(orderId: string): string {
+  return `#${orderId.slice(0, 6).toUpperCase()}`;
+}

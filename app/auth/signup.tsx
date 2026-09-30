@@ -1,166 +1,195 @@
-import { COLORS } from '@/constants/colors';
-import { useAuth } from '@/context/AuthContext';
-import { validateEmail } from '@/lib/utils';
+/**
+ * app/auth/signup.tsx
+ * ===================
+ * Création de compte.
+ *
+ * Tout le monde s'inscrit comme client. Devenir vendeur ou livreur passe
+ * ensuite par une candidature vérifiée — la v1 accordait le rôle vendeur
+ * dès l'inscription, sans attendre le moindre contrôle.
+ */
+
 import { useRouter } from 'expo-router';
-import React, { useState } from 'react';
-import {
-    Alert,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
-} from 'react-native';
+import { useState } from 'react';
+import { Pressable, View } from 'react-native';
 
-export default function SignupScreen() {
+import { Button, Input, Screen, Text, useToast } from '@/components/ui';
+import { useAuth } from '@/context/AuthContext';
+import { useTheme } from '@/hooks/use-theme';
+import { haptic } from '@/lib/feedback';
+import { isValidEmail, isValidPhone } from '@/lib/format';
+import { CAMPUSES, type Campus } from '@/types';
+
+export default function SignUpScreen() {
+  const t = useTheme();
   const router = useRouter();
-  const { signUpClient } = useAuth();
+  const toast = useToast();
+  const { signUp, busy } = useAuth();
+
+  const [displayName, setName] = useState('');
   const [email, setEmail] = useState('');
+  const [phone, setPhone] = useState('');
   const [password, setPassword] = useState('');
-  const [name, setName] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [campus, setCampus] = useState<Campus | undefined>();
+  const [errors, setErrors] = useState<Record<string, string | undefined>>({});
 
-  const handleSignup = async () => {
-    if (!name.trim()) {
-      Alert.alert('Nom requis', 'Entrez votre nom complet');
-      return;
-    }
-    if (!validateEmail(email)) {
-      Alert.alert('Email invalide', 'Vérifiez votre adresse email');
-      return;
-    }
-    if (password.length < 6) {
-      Alert.alert('Mot de passe court', 'Minimum 6 caractères');
-      return;
-    }
+  const submit = async () => {
+    const next: Record<string, string | undefined> = {};
+    if (displayName.trim().length < 2) next.displayName = 'Indiquez votre nom complet.';
+    if (!isValidEmail(email)) next.email = 'Adresse email invalide.';
+    if (phone && !isValidPhone(phone)) next.phone = 'Numéro burkinabè à 8 chiffres.';
+    if (password.length < 8) next.password = 'Au moins 8 caractères.';
 
-    setLoading(true);
+    setErrors(next);
+    if (Object.values(next).some(Boolean)) return;
+
     try {
-      await signUpClient(email, password, name);
-      Alert.alert('✅ Inscription réussie', 'Bienvenue sur AubeShop !');
-      router.replace('/');
-    } catch (err: any) {
-      Alert.alert('Erreur', err.message || 'Impossible de créer le compte');
-    } finally {
-      setLoading(false);
+      await signUp({ email, password, displayName, phone: phone || undefined, campus });
+      toast.success('Bienvenue sur AubeShop !');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Inscription impossible.');
     }
   };
 
+  const clearError = (key: string) =>
+    setErrors((e) => (e[key] ? { ...e, [key]: undefined } : e));
+
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <View style={styles.header}>
-        <Text style={styles.title}>AubeShop</Text>
-        <Text style={styles.subtitle}>Inscription Client</Text>
-      </View>
-
-      <View style={styles.form}>
-        <Text style={styles.label}>Nom complet</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="Votre nom"
-          value={name}
-          onChangeText={setName}
-          editable={!loading}
-          autoCapitalize="words"
-        />
-
-        <Text style={styles.label}>Email</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="votre@email.com"
-          value={email}
-          onChangeText={setEmail}
-          editable={!loading}
-          keyboardType="email-address"
-          autoCapitalize="none"
-        />
-
-        <Text style={styles.label}>Mot de passe</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="••••••••"
-          value={password}
-          onChangeText={setPassword}
-          secureTextEntry
-          editable={!loading}
-        />
-
-        <TouchableOpacity
-          style={[styles.button, { opacity: loading ? 0.5 : 1 }]}
-          onPress={handleSignup}
-          disabled={loading}
-        >
-          <Text style={styles.buttonText}>
-            {loading ? '⏳ Inscription...' : '✓ S\'inscrire'}
+    <Screen scroll edges={['top', 'bottom']}>
+      <View style={{ gap: t.spacing.xl, paddingTop: t.spacing.xxl }}>
+        <View style={{ gap: t.spacing.xxs }}>
+          <Text variant="display">Créer un compte</Text>
+          <Text variant="body" tone="muted">
+            Quelques secondes suffisent pour commencer à acheter.
           </Text>
-        </TouchableOpacity>
-      </View>
+        </View>
 
-      <View style={styles.footer}>
-        <Text style={styles.footerText}>Déjà inscrit ? </Text>
-        <TouchableOpacity onPress={() => router.push('/auth/login')}>
-          <Text style={styles.link}>Se connecter</Text>
-        </TouchableOpacity>
+        <View style={{ gap: t.spacing.md }}>
+          <Input
+            label="Nom complet"
+            placeholder="Awa Traoré"
+            icon="person-outline"
+            value={displayName}
+            onChangeText={(v) => {
+              setName(v);
+              clearError('displayName');
+            }}
+            error={errors.displayName}
+            autoComplete="name"
+            textContentType="name"
+          />
+
+          <Input
+            label="Email"
+            placeholder="vous@exemple.com"
+            icon="mail-outline"
+            value={email}
+            onChangeText={(v) => {
+              setEmail(v);
+              clearError('email');
+            }}
+            error={errors.email}
+            keyboardType="email-address"
+            autoCapitalize="none"
+            autoComplete="email"
+            textContentType="emailAddress"
+          />
+
+          <Input
+            label="Téléphone"
+            placeholder="70 12 34 56"
+            icon="call-outline"
+            suffix="+226"
+            hint="Pour que le vendeur et le livreur puissent vous joindre."
+            value={phone}
+            onChangeText={(v) => {
+              setPhone(v);
+              clearError('phone');
+            }}
+            error={errors.phone}
+            keyboardType="phone-pad"
+            autoComplete="tel"
+          />
+
+          <Input
+            label="Mot de passe"
+            placeholder="8 caractères minimum"
+            icon="lock-closed-outline"
+            revealable
+            value={password}
+            onChangeText={(v) => {
+              setPassword(v);
+              clearError('password');
+            }}
+            error={errors.password}
+            autoCapitalize="none"
+            autoComplete="new-password"
+            textContentType="newPassword"
+          />
+
+          <View style={{ gap: t.spacing.xs }}>
+            <Text variant="captionStrong" tone="muted">
+              Campus (facultatif)
+            </Text>
+            <View style={{ flexDirection: 'row', gap: t.spacing.sm }}>
+              {CAMPUSES.map((c) => {
+                const active = campus === c;
+                return (
+                  <Pressable
+                    key={c}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: active }}
+                    accessibilityLabel={`Campus ${c}`}
+                    onPress={() => {
+                      haptic('select');
+                      setCampus(active ? undefined : c);
+                    }}
+                    style={({ pressed }) => ({
+                      flex: 1,
+                      height: 44,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      borderRadius: t.radius.md,
+                      backgroundColor: active ? t.colors.primarySubtle : t.colors.surface,
+                      borderWidth: 1,
+                      borderColor: active ? t.colors.primary : t.colors.border,
+                      opacity: pressed ? 0.75 : 1,
+                    })}>
+                    <Text
+                      variant="captionStrong"
+                      style={{ color: active ? t.colors.primaryText : t.colors.textMuted }}>
+                      {c}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          </View>
+
+          <Button label="Créer mon compte" block loading={busy} onPress={submit} />
+
+          <Text variant="caption" tone="subtle" center>
+            En créant un compte, vous acceptez les conditions d&apos;utilisation d&apos;AubeShop.
+          </Text>
+        </View>
+
+        <View
+          style={{
+            flexDirection: 'row',
+            justifyContent: 'center',
+            alignItems: 'center',
+            gap: t.spacing.xs,
+          }}>
+          <Text variant="body" tone="muted">
+            Déjà inscrit ?
+          </Text>
+          <Button
+            label="Se connecter"
+            variant="ghost"
+            size="sm"
+            onPress={() => router.replace('/auth/login')}
+          />
+        </View>
       </View>
-    </ScrollView>
+    </Screen>
   );
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: COLORS.tertiary },
-  content: { paddingHorizontal: 20, paddingVertical: 30 },
-  header: { alignItems: 'center', marginBottom: 40 },
-  title: {
-    fontSize: 32,
-    fontWeight: 'bold',
-    color: COLORS.primary,
-    marginBottom: 8,
-  },
-  subtitle: {
-    fontSize: 18,
-    color: COLORS.grayDark,
-  },
-  form: { marginBottom: 30 },
-  label: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: COLORS.secondary,
-    marginBottom: 8,
-  },
-  input: {
-    borderWidth: 1,
-    borderColor: COLORS.grayMedium,
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    marginBottom: 16,
-    fontSize: 14,
-    backgroundColor: COLORS.tertiaryLight,
-  },
-  button: {
-    backgroundColor: COLORS.primary,
-    paddingVertical: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-    marginTop: 20,
-  },
-  buttonText: {
-    color: COLORS.tertiary,
-    fontWeight: 'bold',
-    fontSize: 16,
-  },
-  footer: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-  },
-  footerText: {
-    fontSize: 14,
-    color: COLORS.grayDark,
-  },
-  link: {
-    fontSize: 14,
-    color: COLORS.primary,
-    fontWeight: 'bold',
-  },
-});

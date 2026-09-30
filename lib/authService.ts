@@ -1,331 +1,383 @@
 /**
  * lib/authService.ts
  * ==================
- * Service d'authentification - Gère inscription, connexion, et vérification
- * Commentaires en français
+ * Comptes, candidatures et profils métier.
+ *
+ * Changement de fond par rapport à la v1 : **le rôle n'est accordé qu'après
+ * validation**. La v1 écrivait `role: 'vendor'` dès l'inscription, sans
+ * attendre la vérification — un vendeur non approuvé disposait donc de tous
+ * les droits de vente, ce qui vidait de son sens le contrôle du statut
+ * étudiant, c'est-à-dire la raison d'être d'AubeShop.
+ *
+ * Ici, un candidat reste `client` et possède une `Application` ouverte. Un
+ * administrateur la valide, ce qui bascule le rôle et crée le profil métier.
  */
 
 import {
-    createUserWithEmailAndPassword,
-    User as FirebaseUser,
-    sendEmailVerification,
-    sendPasswordResetEmail,
-    signInWithEmailAndPassword,
-    signOut,
+  createUserWithEmailAndPassword,
+  sendEmailVerification,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signOut as fbSignOut,
+  updateProfile as fbUpdateProfile,
 } from 'firebase/auth';
-import {
-    addDoc,
-    collection,
-    doc,
-    getDoc,
-    getDocs,
-    query,
-    setDoc,
-    updateDoc,
-    where,
-} from 'firebase/firestore';
-import { User, Vendor, VendorSignUpInput } from '../types/index';
+import { doc, getDoc, serverTimestamp, setDoc, updateDoc } from 'firebase/firestore';
+
+import type {
+  Address,
+  Application,
+  ApplicationInput,
+  Campus,
+  CourierProfile,
+  SignUpInput,
+  User,
+  UserRole,
+  VendorProfile,
+} from '@/types';
+import { ROLE_FOR_APPLICATION } from '@/types';
 import { auth, firestore } from './firebase.config';
+import { uploadImage } from './uploadService';
+
+// ============================================
+// ERREURS
+// ============================================
+
+/** Traduit les codes Firebase en messages affichables tels quels. */
+export function authErrorMessage(error: unknown): string {
+  const code = (error as { code?: string })?.code ?? '';
+
+  const messages: Record<string, string> = {
+    'auth/email-already-in-use': 'Un compte existe déjà avec cet email.',
+    'auth/invalid-email': "Cette adresse email n'est pas valide.",
+    'auth/weak-password': 'Le mot de passe doit contenir au moins 8 caractères.',
+    'auth/user-not-found': 'Aucun compte ne correspond à cet email.',
+    'auth/wrong-password': 'Mot de passe incorrect.',
+    // Firebase renvoie ce code générique depuis l'activation de la protection
+    // contre l'énumération de comptes : il couvre email inconnu ET mauvais
+    // mot de passe, d'où la formulation volontairement vague.
+    'auth/invalid-credential': 'Email ou mot de passe incorrect.',
+    'auth/too-many-requests': 'Trop de tentatives. Réessayez dans quelques minutes.',
+    'auth/network-request-failed': 'Connexion impossible. Vérifiez votre réseau.',
+    'permission-denied': "Vous n'avez pas les droits pour cette action.",
+  };
+
+  if (messages[code]) return messages[code];
+  const message = (error as { message?: string })?.message;
+  return message && !message.includes('Firebase') ? message : 'Une erreur est survenue.';
+}
+
+// ============================================
+// LECTURE
+// ============================================
+
+export async function fetchUser(uid: string): Promise<User | null> {
+  const snap = await getDoc(doc(firestore, 'users', uid));
+  return snap.exists() ? ({ ...snap.data(), uid } as User) : null;
+}
+
+export async function fetchVendorProfile(uid: string): Promise<VendorProfile | null> {
+  const snap = await getDoc(doc(firestore, 'vendors', uid));
+  return snap.exists() ? ({ ...snap.data(), uid } as VendorProfile) : null;
+}
+
+export async function fetchCourierProfile(uid: string): Promise<CourierProfile | null> {
+  const snap = await getDoc(doc(firestore, 'couriers', uid));
+  return snap.exists() ? ({ ...snap.data(), uid } as CourierProfile) : null;
+}
+
+export async function fetchApplication(uid: string): Promise<Application | null> {
+  const snap = await getDoc(doc(firestore, 'applications', uid));
+  return snap.exists() ? ({ ...snap.data(), uid } as Application) : null;
+}
+
+// ============================================
+// INSCRIPTION & CONNEXION
+// ============================================
 
 /**
- * AuthService - Service centralisé pour l'authentification
- * Classe contenant toutes les opérations d'auth
+ * Crée un compte. Tout nouveau venu est `client` : devenir vendeur ou
+ * livreur passe ensuite par une candidature.
  */
-export class AuthService {
-  /**
-   * Inscription Client
-   * @param email - Email de l'utilisateur
-   * @param password - Mot de passe (min 8 caractères)
-   * @param displayName - Nom complet
-   * @returns { uid } - UID de l'utilisateur créé
-   */
-  static async signUpClient(
-    email: string,
-    password: string,
-    displayName: string
-  ): Promise<{ uid: string }> {
-    try {
-      // 1. Valider entrées
-      if (!email || !password || !displayName) {
-        throw new Error('Email, mot de passe et nom requis');
-      }
-      if (password.length < 8) {
-        throw new Error('Le mot de passe doit avoir au moins 8 caractères');
-      }
+export async function signUp(input: SignUpInput): Promise<void> {
+  const email = input.email.trim().toLowerCase();
+  const displayName = input.displayName.trim();
 
-      // 2. Créer utilisateur Firebase Auth
-      const userCredential = await createUserWithEmailAndPassword(
-        auth,
-        email,
-        password
-      );
-      const uid = userCredential.user.uid;
-
-      // 3. Créer document utilisateur dans Firestore
-      const userDocRef = doc(firestore, 'users', uid);
-      const newUser: User = {
-        uid,
-        email,
-        displayName,
-        role: 'client',
-        avatar: undefined,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        isActive: true,
-      };
-
-      await setDoc(userDocRef, newUser);
-
-      // 4. Envoyer email de confirmation (optionnel)
-      try {
-        await sendEmailVerification(userCredential.user);
-        console.log('✅ Email de confirmation envoyé');
-      } catch (err) {
-        console.warn('⚠️ Erreur envoi email confirmation:', err);
-      }
-
-      return { uid };
-    } catch (error: any) {
-      console.error('❌ Erreur inscription client:', error);
-      throw this.handleFirebaseError(error);
-    }
+  if (input.password.length < 8) {
+    throw new Error('Le mot de passe doit contenir au moins 8 caractères.');
+  }
+  if (!displayName) {
+    throw new Error('Votre nom est requis.');
   }
 
-  /**
-   * Inscription Vendeur avec vérification
-   * @param data - Données du vendeur
-   * @returns { vendorId, status, message }
-   */
-  static async signUpVendor(
-    data: VendorSignUpInput
-  ): Promise<{ vendorId: string; status: string; message: string }> {
-    try {
-      // 1. Valider données
-      if (!data.email || !data.password || !data.displayName) {
-        throw new Error('Email, mot de passe et nom requis');
-      }
+  const credential = await createUserWithEmailAndPassword(auth, email, input.password);
+  const { uid } = credential.user;
 
-      // 2. Créer utilisateur Firebase Auth
-      const userCredential = await createUserWithEmailAndPassword(
-        auth,
-        data.email,
-        data.password
-      );
-      const uid = userCredential.user.uid;
+  // Renseigne le nom côté Auth : utile pour les emails transactionnels.
+  await fbUpdateProfile(credential.user, { displayName }).catch(() => {});
 
-      // 3. Déterminer méthode de vérification et statut initial
-      let verificationStatus: 'pending' | 'approved' = 'pending';
-      let approvedAt: number | undefined;
+  const now = Date.now();
+  const user: User = {
+    uid,
+    email,
+    displayName,
+    phone: input.phone?.trim() || undefined,
+    role: 'client',
+    campus: input.campus,
+    addresses: [],
+    isBlocked: false,
+    createdAt: now,
+    updatedAt: now,
+  };
 
-      if (data.verificationMethod === 'email' && data.universityEmail) {
-        // Vérifier si email universitaire est autorisé
-        const isValidEmail = await this.isValidUniversityEmail(
-          data.universityEmail
-        );
-        if (isValidEmail) {
-          verificationStatus = 'approved';
-          approvedAt = Date.now();
-        }
-      }
+  await setDoc(doc(firestore, 'users', uid), stripUndefined(user));
 
-      // 4. Créer document utilisateur
-      const newUser: User = {
-        uid,
-        email: data.email,
-        displayName: data.displayName,
-        role: 'vendor',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        isActive: true,
-      };
+  // La vérification d'email conditionne la validation automatique d'une
+  // future candidature étudiante : on la lance dès maintenant. Un échec
+  // d'envoi ne doit pas faire échouer l'inscription.
+  void sendEmailVerification(credential.user).catch(() => {});
+}
 
-      await setDoc(doc(firestore, 'users', uid), newUser);
+export async function signIn(email: string, password: string): Promise<void> {
+  const credential = await signInWithEmailAndPassword(
+    auth,
+    email.trim().toLowerCase(),
+    password
+  );
 
-      // 5. Créer document vendeur
-      const vendorData: Vendor = {
-        ...newUser,
-        vendorId: uid,
-        universityId: data.universityId,
-        universityEmail: data.universityEmail || '',
-        verificationMethod: data.verificationMethod,
-        verificationStatus,
-        verificationDate: approvedAt,
-        bio: '',
-        storeName: data.storeName,
-        rating: 0,
-        totalReviews: 0,
-        totalSales: 0,
-        commissionBalance: 0,
-      };
-
-      await setDoc(doc(firestore, 'vendors', uid), vendorData);
-
-      // 6. Si badge upload, créer AdminApproval
-      if (data.verificationMethod === 'badge' && data.badgeImage) {
-        await addDoc(collection(firestore, 'adminApprovals'), {
-          vendorId: uid,
-          vendorName: data.displayName,
-          vendorEmail: data.email,
-          universityId: data.universityId,
-          verificationMethod: 'badge',
-          badgeUrl: data.badgeImage, // À adapter après upload Storage
-          status: 'pending',
-          submittedAt: Date.now(),
-        });
-      }
-
-      const message =
-        verificationStatus === 'approved'
-          ? '✅ Bienvenue ! Votre compte vendeur est activé'
-          : '⏳ Votre demande est en attente d\'approbation (24-48h)';
-
-      return { vendorId: uid, status: verificationStatus, message };
-    } catch (error: any) {
-      console.error('❌ Erreur inscription vendeur:', error);
-      throw this.handleFirebaseError(error);
-    }
-  }
-
-  /**
-   * Connexion utilisateur
-   * @param email - Email
-   * @param password - Mot de passe
-   * @returns { uid, role }
-   */
-  static async login(
-    email: string,
-    password: string
-  ): Promise<{ uid: string; role: string }> {
-    try {
-      // 1. Authentifier avec Firebase Auth
-      const userCredential = await signInWithEmailAndPassword(
-        auth,
-        email,
-        password
-      );
-      const uid = userCredential.user.uid;
-
-      // 2. Récupérer le rôle depuis Firestore
-      const userDocRef = doc(firestore, 'users', uid);
-      const userSnapshot = await getDoc(userDocRef);
-
-      if (!userSnapshot.exists()) {
-        throw new Error('Document utilisateur non trouvé');
-      }
-
-      const role = userSnapshot.data()?.role || 'client';
-
-      // 3. Mettre à jour lastLogin
-      await updateDoc(userDocRef, {
-        updatedAt: Date.now(),
-        'metadata.lastLogin': Date.now(),
-      });
-
-      return { uid, role };
-    } catch (error: any) {
-      console.error('❌ Erreur connexion:', error);
-      throw this.handleFirebaseError(error);
-    }
-  }
-
-  /**
-   * Déconnexion utilisateur
-   */
-  static async logout(): Promise<void> {
-    try {
-      await signOut(auth);
-      console.log('✅ Déconnexion réussie');
-    } catch (error: any) {
-      console.error('❌ Erreur déconnexion:', error);
-      throw this.handleFirebaseError(error);
-    }
-  }
-
-  /**
-   * Réinitialiser mot de passe (envoi email)
-   * @param email - Email de l'utilisateur
-   */
-  static async resetPassword(email: string): Promise<void> {
-    try {
-      await sendPasswordResetEmail(auth, email);
-      console.log('✅ Email de réinitialisation envoyé');
-    } catch (error: any) {
-      console.error('❌ Erreur réinitialisation:', error);
-      throw this.handleFirebaseError(error);
-    }
-  }
-
-  /**
-   * Récupérer utilisateur actuel
-   * @returns FirebaseUser ou null
-   */
-  static getCurrentUser(): FirebaseUser | null {
-    return auth.currentUser;
-  }
-
-  /**
-   * Vérifier si email universitaire est valide
-   * @param universityEmail - Email université
-   * @returns true si domaine autorisé
-   */
-  static async isValidUniversityEmail(universityEmail: string): Promise<boolean> {
-    try {
-      // Extraire domaine
-      const domain = universityEmail.split('@')[1];
-      if (!domain) return false;
-
-      // Vérifier dans Firestore
-      const domainsRef = collection(firestore, 'verificationDomains');
-      const q = query(
-        domainsRef,
-        where('domain', '==', domain),
-        where('isActive', '==', true),
-        where('autoVerify', '==', true)
-      );
-
-      const snapshot = await getDocs(q);
-      return snapshot.docs.length > 0;
-    } catch (error) {
-      console.error('❌ Erreur validation email:', error);
-      return false;
-    }
-  }
-
-  /**
-   * Gérer les erreurs Firebase
-   * @param error - Erreur Firebase
-   * @returns Message d'erreur lisible
-   */
-  private static handleFirebaseError(error: any): Error {
-    let message = 'Erreur inconnue';
-
-    if (error.code) {
-      switch (error.code) {
-        case 'auth/email-already-in-use':
-          message = 'Cet email est déjà utilisé';
-          break;
-        case 'auth/weak-password':
-          message = 'Le mot de passe doit avoir au moins 8 caractères';
-          break;
-        case 'auth/invalid-email':
-          message = 'Email invalide';
-          break;
-        case 'auth/user-not-found':
-          message = 'Utilisateur non trouvé';
-          break;
-        case 'auth/wrong-password':
-          message = 'Mot de passe incorrect';
-          break;
-        case 'auth/too-many-requests':
-          message = 'Trop de tentatives. Réessayez plus tard';
-          break;
-        default:
-          message = error.message || 'Erreur authentification';
-      }
-    }
-
-    return new Error(message);
+  const user = await fetchUser(credential.user.uid);
+  if (user?.isBlocked) {
+    await fbSignOut(auth);
+    throw new Error('Ce compte a été suspendu. Contactez le support AubeShop.');
   }
 }
 
-export default AuthService;
+export async function signOut(): Promise<void> {
+  await fbSignOut(auth);
+}
+
+export async function resetPassword(email: string): Promise<void> {
+  await sendPasswordResetEmail(auth, email.trim().toLowerCase());
+}
+
+// ============================================
+// PROFIL
+// ============================================
+
+export async function updateUserProfile(
+  uid: string,
+  patch: Partial<Pick<User, 'displayName' | 'phone' | 'campus' | 'avatar'>>
+): Promise<void> {
+  await updateDoc(doc(firestore, 'users', uid), {
+    ...stripUndefined(patch),
+    updatedAt: Date.now(),
+  });
+}
+
+/**
+ * Ajoute ou remplace une adresse.
+ *
+ * Écrit le tableau complet plutôt qu'un `arrayUnion` : il faut pouvoir
+ * modifier une adresse existante et garantir qu'une seule porte `isDefault`.
+ */
+export async function saveAddress(
+  uid: string,
+  addresses: Address[],
+  address: Address
+): Promise<Address[]> {
+  const index = addresses.findIndex((a) => a.id === address.id);
+  const next = index >= 0
+    ? addresses.map((a) => (a.id === address.id ? address : a))
+    : [...addresses, address];
+
+  // La toute première adresse devient l'adresse par défaut d'office.
+  const normalized = next.map((a) => ({
+    ...a,
+    isDefault: next.length === 1 ? true : address.isDefault ? a.id === address.id : a.isDefault,
+  }));
+
+  await updateDoc(doc(firestore, 'users', uid), {
+    addresses: normalized,
+    updatedAt: Date.now(),
+  });
+  return normalized;
+}
+
+export async function deleteAddress(
+  uid: string,
+  addresses: Address[],
+  addressId: string
+): Promise<Address[]> {
+  const next = addresses.filter((a) => a.id !== addressId);
+  // Si on vient de supprimer l'adresse par défaut, la première reprend le rôle.
+  if (next.length > 0 && !next.some((a) => a.isDefault)) {
+    next[0] = { ...next[0], isDefault: true };
+  }
+
+  await updateDoc(doc(firestore, 'users', uid), {
+    addresses: next,
+    updatedAt: Date.now(),
+  });
+  return next;
+}
+
+// ============================================
+// CANDIDATURES
+// ============================================
+
+/**
+ * Dépose une candidature vendeur ou livreur.
+ *
+ * Le justificatif part vers Storage **avant** l'écriture du document : on
+ * n'enregistre jamais une URI locale, contrairement à la v1 où le badge
+ * étudiant pointait vers le téléphone du candidat.
+ */
+export async function submitApplication(
+  user: User,
+  input: ApplicationInput
+): Promise<Application> {
+  const existing = await fetchApplication(user.uid);
+  if (existing?.status === 'pending') {
+    throw new Error('Vous avez déjà une candidature en cours d’examen.');
+  }
+  if (existing?.status === 'approved') {
+    throw new Error('Votre candidature a déjà été acceptée.');
+  }
+
+  let documentUrl: string | undefined;
+  if (input.documentImage) {
+    documentUrl = await uploadImage(input.documentImage, `applications/${user.uid}`);
+  }
+
+  if (input.method === 'university_email' && !input.universityEmail) {
+    throw new Error('Renseignez votre email universitaire.');
+  }
+  if (input.method !== 'university_email' && !documentUrl) {
+    throw new Error('Un justificatif est requis.');
+  }
+
+  const application: Application = {
+    uid: user.uid,
+    kind: input.kind,
+    status: 'pending',
+    displayName: user.displayName,
+    email: user.email,
+    phone: input.phone,
+    campus: input.campus,
+    method: input.method,
+    documentUrl,
+    universityEmail: input.universityEmail?.trim().toLowerCase(),
+    storeName: input.storeName?.trim(),
+    studentId: input.studentId?.trim(),
+    businessId: input.businessId?.trim(),
+    standLocation: input.standLocation?.trim(),
+    vehicle: input.vehicle,
+    zones: input.zones,
+    submittedAt: Date.now(),
+  };
+
+  await setDoc(doc(firestore, 'applications', user.uid), stripUndefined(application));
+  return application;
+}
+
+/**
+ * Valide une candidature : bascule le rôle et crée le profil métier.
+ *
+ * Réservé aux administrateurs, ce que les règles Firestore imposent — la v1
+ * se contentait de masquer le bouton dans l'écran de profil, si bien que
+ * n'importe quel client connecté pouvait atteindre `/admin` et approuver
+ * des vendeurs.
+ */
+export async function approveApplication(
+  application: Application,
+  reviewerUid: string
+): Promise<void> {
+  const role: UserRole = ROLE_FOR_APPLICATION[application.kind];
+  const now = Date.now();
+
+  if (application.kind === 'courier') {
+    const profile: CourierProfile = {
+      uid: application.uid,
+      displayName: application.displayName,
+      phone: application.phone,
+      campus: application.campus,
+      vehicle: application.vehicle ?? 'motorbike',
+      zones: application.zones ?? ['campus'],
+      isAvailable: false,
+      rating: 0,
+      reviewCount: 0,
+      deliveryCount: 0,
+      totalEarnings: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await setDoc(doc(firestore, 'couriers', application.uid), stripUndefined(profile));
+  } else {
+    const profile: VendorProfile = {
+      uid: application.uid,
+      kind: application.kind === 'partner_vendor' ? 'partner' : 'student',
+      storeName: application.storeName || application.displayName,
+      bio: '',
+      campus: application.campus,
+      stand:
+        application.kind === 'partner_vendor'
+          ? {
+              location: application.standLocation ?? '',
+              openingHours: '',
+              businessId: application.businessId,
+            }
+          : undefined,
+      isOpen: true,
+      rating: 0,
+      reviewCount: 0,
+      salesCount: 0,
+      totalEarnings: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await setDoc(doc(firestore, 'vendors', application.uid), stripUndefined(profile));
+  }
+
+  await updateDoc(doc(firestore, 'users', application.uid), { role, updatedAt: now });
+  await updateDoc(doc(firestore, 'applications', application.uid), {
+    status: 'approved',
+    reviewedAt: now,
+    reviewedBy: reviewerUid,
+  });
+}
+
+/** Refuse une candidature. Le motif est communiqué au candidat. */
+export async function rejectApplication(
+  uid: string,
+  reviewerUid: string,
+  reason: string
+): Promise<void> {
+  await updateDoc(doc(firestore, 'applications', uid), {
+    status: 'rejected',
+    reviewedAt: Date.now(),
+    reviewedBy: reviewerUid,
+    rejectionReason: reason,
+  });
+}
+
+// ============================================
+// OUTILS
+// ============================================
+
+/**
+ * Retire les clés `undefined` : Firestore les rejette, là où il accepte
+ * `null`. Évite un « Unsupported field value: undefined » à l'écriture d'un
+ * champ optionnel non renseigné.
+ */
+export function stripUndefined<T extends object>(value: T): T {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, v]) => v !== undefined)
+  ) as T;
+}
+
+/** Marqueur d'horodatage serveur, pour les champs qui n'ont pas à être devinés. */
+export { serverTimestamp };
+
+/** Libellé lisible d'un campus, avec repli. */
+export function campusLabel(campus: Campus | undefined): string {
+  return campus ?? 'Campus non précisé';
+}

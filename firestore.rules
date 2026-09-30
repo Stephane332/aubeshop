@@ -1,240 +1,380 @@
-// ============================================
-// RÈGLES DE SÉCURITÉ FIRESTORE - AubeShop
-// ============================================
-// Fichier : firestore.rules
-//
-// Authentification : Tous les utilisateurs doivent être authentifiés (sauf lecture catalogue)
-// Autorisation : Basée sur le rôle (client, vendor, admin)
-// 
-// À déployer dans Firebase Console :
-// 1. Firestore Database > Rules
-// 2. Copier/coller ce contenu
-// 3. Publish
-// ============================================
-
 rules_version = '2';
+
+// ============================================================
+// RÈGLES DE SÉCURITÉ FIRESTORE — AubeShop
+// ============================================================
+//
+// Réécriture complète. La version précédente comportait trois failles
+// exploitables et une erreur de syntaxe qui bloquait l'application :
+//
+// 1. `allow create: if request.auth == null` sur `notifications` et
+//    `commissions`. L'intention était « réservé au serveur », mais les
+//    Cloud Functions utilisent le SDK Admin et contournent ces règles :
+//    la ligne ouvrait donc ces collections à n'importe quel inconnu, tout
+//    en refusant les écritures légitimes de l'app.
+// 2. Les commandes n'étaient validées sur aucun montant : le client
+//    écrivant le document lui-même, il pouvait fixer `pricing.total` à 0.
+// 3. Un vendeur pouvait modifier n'importe quel champ d'une commande
+//    reçue, y compris le prix, le statut de paiement et sa propre note.
+// 4. `request.resource.data.diff.delta` n'est pas une expression valide —
+//    la syntaxe est `diff(resource.data).affectedKeys()`. Ces règles
+//    levaient une erreur, donc refusaient tout : aucun vendeur ne pouvait
+//    modifier son profil.
+//
+// Principe directeur : **le rôle porte le droit**. Un candidat vendeur
+// reste `client` jusqu'à validation, donc il suffit de lire `role`.
+// ============================================================
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ============================================
-    // FONCTION UTILITAIRES
-    // ============================================
+    // ========================================
+    // OUTILS
+    // ========================================
 
-    // Vérifier si l'utilisateur est authentifié
-    function isAuthenticated() {
+    function isSignedIn() {
       return request.auth != null;
     }
 
-    // Vérifier si l'utilisateur est propriétaire du document
-    function isOwner(userId) {
-      return request.auth.uid == userId;
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
     }
 
-    // Récupérer le rôle d'un utilisateur
-    function getUserRole(userId) {
-      return get(/databases/$(database)/documents/users/$(userId)).data.role;
+    /** Document du compte appelant. Firestore mutualise les `get()`
+        identiques au sein d'une même évaluation. */
+    function account() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
     }
 
-    // Vérifier si c'est un vendeur vérifié
-    function isVerifiedVendor(vendorId) {
-      let vendorDoc = get(/databases/$(database)/documents/vendors/$(vendorId));
-      return vendorDoc.data.verificationStatus == 'approved';
+    function role() {
+      return isSignedIn() ? account().role : 'anonymous';
     }
 
-    // Vérifier si c'est un admin
     function isAdmin() {
-      return getUserRole(request.auth.uid) == 'admin';
+      return isSignedIn() && role() == 'admin';
     }
 
-    // ============================================
-    // COLLECTION : users
-    // ============================================
+    function isVendor() {
+      return role() == 'student_vendor' || role() == 'partner_vendor';
+    }
+
+    function isCourier() {
+      return role() == 'courier';
+    }
+
+    /** Un compte suspendu ne peut plus rien écrire. */
+    function isActive() {
+      return isSignedIn() && account().isBlocked == false;
+    }
+
+    /** Champs modifiés par cette écriture. */
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    /** L'écriture ne touche-t-elle QUE ces champs ? */
+    function onlyChanges(allowed) {
+      return changed().hasOnly(allowed);
+    }
+
+    function isPositiveInt(value) {
+      return value is int && value >= 0;
+    }
+
+    // ========================================
+    // users
+    // ========================================
     match /users/{userId} {
-      // Lecture : Propriétaire peut lire son profil, admin peut tout lire
-      allow read: if isOwner(userId) || isAdmin();
-      
-      // Écriture création : Authenticated user crée son propre compte
-      allow create: if isAuthenticated() && request.auth.uid == userId 
-                    && request.resource.data.role in ['client', 'vendor'];
-      
-      // Écriture mise à jour : Propriétaire peut modifier son profil (sauf le rôle)
-      allow update: if isOwner(userId) && 
-                    (!('role' in request.resource.data) || 
-                     request.resource.data.role == resource.data.role);
-      
-      // Suppression : Admin seulement
-      allow delete: if isAdmin();
+      // Le profil public d'un vendeur vit dans /vendors ; /users reste
+      // privé. Un utilisateur authentifié peut toutefois lire les comptes
+      // pour afficher un nom de client sur une commande.
+      allow get: if isSelf(userId) || isAdmin() || isSignedIn();
+      allow list: if isAdmin();
+
+      // À l'inscription, on ne peut se créer que comme client : le rôle
+      // ne s'obtient que par une candidature validée.
+      allow create: if isSelf(userId)
+                    && request.resource.data.role == 'client'
+                    && request.resource.data.isBlocked == false
+                    && request.resource.data.uid == userId;
+
+      // On modifie son propre profil, mais jamais son rôle ni son blocage.
+      allow update: if isSelf(userId)
+                    && !changed().hasAny(['role', 'isBlocked', 'uid', 'createdAt']);
+
+      // Seul un administrateur accorde un rôle ou suspend un compte.
+      allow update: if isAdmin()
+                    && onlyChanges(['role', 'isBlocked', 'updatedAt']);
+
+      allow delete: if false;
     }
 
-    // ============================================
-    // COLLECTION : vendors
-    // ============================================
+    // ========================================
+    // vendors — vitrines publiques
+    // ========================================
     match /vendors/{vendorId} {
-      // Lecture : Tous les vendeurs approuvés sont lisibles (catalogue), propriétaire voit le sien
-      allow read: if resource.data.verificationStatus == 'approved' || 
-                  isOwner(vendorId) || 
-                  isAdmin();
-      
-      // Écriture création : Étudiant crée sa candidature vendeur
-      allow create: if isAuthenticated() && request.auth.uid == vendorId &&
-                    request.resource.data.verificationStatus == 'pending';
-      
-      // Écriture mise à jour : Vendeur modifie son profil (sauf verificationStatus)
-      allow update: if isOwner(vendorId) &&
-                    (!('verificationStatus' in request.resource.data.diff.delta) &&
-                     !('approvedBy' in request.resource.data.diff.delta));
-      
-      // Mise à jour du statut de vérification : Admin seulement
-      allow update: if isAdmin() && 
-                    ('verificationStatus' in request.resource.data.diff.delta || 
-                     'approvedBy' in request.resource.data.diff.delta);
-      
-      // Suppression : Admin seulement
-      allow delete: if isAdmin();
-    }
-
-    // ============================================
-    // COLLECTION : products
-    // ============================================
-    match /products/{productId} {
-      // Lecture : Tous lisent les produits actifs (catalogue public)
-      allow read: if resource.data.isActive == true;
-      
-      // Lecture privée : Vendeur lit tous ses produits (actifs ou non)
-      allow read: if isAuthenticated() && 
-                  request.auth.uid == resource.data.vendorId;
-      
-      // Écriture création : Vendeur vérifié crée ses produits
-      allow create: if isAuthenticated() && 
-                    request.auth.uid == request.resource.data.vendorId &&
-                    isVerifiedVendor(request.auth.uid);
-      
-      // Écriture mise à jour : Vendeur modifie ses produits
-      allow update: if isAuthenticated() && 
-                    request.auth.uid == resource.data.vendorId &&
-                    request.auth.uid == request.resource.data.vendorId;
-      
-      // Suppression : Vendeur supprime ses produits
-      allow delete: if isAuthenticated() && 
-                    request.auth.uid == resource.data.vendorId;
-    }
-
-    // ============================================
-    // COLLECTION : orders
-    // ============================================
-    match /orders/{orderId} {
-      // Lecture : Client ou Vendeur peuvent voir leurs commandes, admin voit tout
-      allow read: if isAuthenticated() && 
-                  (request.auth.uid == resource.data.clientId || 
-                   request.auth.uid == resource.data.vendorId ||
-                   isAdmin());
-      
-      // Écriture création : Client crée une commande
-      allow create: if isAuthenticated() && 
-                    request.auth.uid == request.resource.data.clientId &&
-                    request.resource.data.status == 'pending' &&
-                    request.resource.data.paymentStatus == 'pending';
-      
-      // Mise à jour par vendeur : Marquer acceptée/en cours/livrée
-      allow update: if isAuthenticated() && 
-                    request.auth.uid == resource.data.vendorId &&
-                    request.resource.data.clientId == resource.data.clientId &&
-                    request.resource.data.vendorId == resource.data.vendorId;
-      
-      // Mise à jour par client : Annulation ou rating après livraison
-      allow update: if isAuthenticated() && 
-                    request.auth.uid == resource.data.clientId &&
-                    (request.resource.data.status == 'cancelled' ||
-                     'rating' in request.resource.data.diff.delta);
-      
-      // Suppression : Admin seulement
-      allow delete: if isAdmin();
-    }
-
-    // ============================================
-    // COLLECTION : cart (Panier - Optionnel)
-    // ============================================
-    match /cart/{userId} {
-      // Lecture/Écriture : Propriétaire du panier
-      allow read, write: if isAuthenticated() && isOwner(userId);
-      
-      // Suppression : Propriétaire après checkout
-      allow delete: if isAuthenticated() && isOwner(userId);
-    }
-
-    // ============================================
-    // COLLECTION : notifications
-    // ============================================
-    match /notifications/{notificationId} {
-      // Lecture : Propriétaire voit ses notifications
-      allow read: if isAuthenticated() && 
-                  request.auth.uid == resource.data.userId;
-      
-      // Écriture création : Cloud Function (serveur) - pas d'auth
-      allow create: if request.auth == null;
-      
-      // Mise à jour : Propriétaire marque comme lu
-      allow update: if isAuthenticated() && 
-                    request.auth.uid == resource.data.userId;
-      
-      // Suppression : Propriétaire
-      allow delete: if isAuthenticated() && 
-                    request.auth.uid == resource.data.userId;
-    }
-
-    // ============================================
-    // COLLECTION : verificationDomains
-    // ============================================
-    match /verificationDomains/{domain} {
-      // Lecture : Tous lisent (publique, config d'app)
+      // Le catalogue est public : la boutique doit l'être aussi.
       allow read: if true;
-      
-      // Écriture : Admin seulement
-      allow write: if isAdmin();
-    }
 
-    // ============================================
-    // COLLECTION : adminApprovals
-    // ============================================
-    match /adminApprovals/{approvalId} {
-      // Lecture : Admin + vendeur en attente voit sa demande
-      allow read: if isAdmin() || 
-                  (isAuthenticated() && 
-                   request.auth.uid == resource.data.vendorId);
-      
-      // Écriture création : Vendeur crée sa demande
-      allow create: if isAuthenticated() && 
-                    request.auth.uid == request.resource.data.vendorId &&
-                    request.resource.data.status == 'pending';
-      
-      // Mise à jour : Admin approuve/rejette
+      // Créée par l'administrateur au moment de valider la candidature.
+      allow create: if isAdmin();
+
+      // Le vendeur gère sa vitrine, sans toucher aux compteurs que le
+      // système tient pour lui.
+      allow update: if isSelf(vendorId)
+                    && isActive()
+                    && onlyChanges([
+                         'storeName', 'bio', 'logo', 'pickupPoint',
+                         'pickupHours', 'stand', 'isOpen', 'updatedAt'
+                       ]);
+
+      // Les agrégats et le type de vendeur relèvent de l'administration.
       allow update: if isAdmin();
-      
-      // Suppression : Admin archive
       allow delete: if isAdmin();
     }
 
-    // ============================================
-    // COLLECTION : commissions
-    // ============================================
+    // ========================================
+    // couriers
+    // ========================================
+    match /couriers/{courierId} {
+      // Le client voit le nom du livreur affecté à sa commande.
+      allow get: if isSignedIn();
+      allow list: if isAdmin();
+
+      allow create: if isAdmin();
+
+      // Le livreur règle sa disponibilité et ses zones ; ses gains et son
+      // compteur de courses ne sont écrits que par une livraison validée.
+      allow update: if isSelf(courierId)
+                    && isActive()
+                    && onlyChanges(['isAvailable', 'zones', 'phone', 'vehicle', 'updatedAt']);
+
+      // Crédit d'une course : le livreur lui-même, à la livraison.
+      allow update: if isSelf(courierId)
+                    && onlyChanges(['deliveryCount', 'totalEarnings', 'updatedAt'])
+                    && request.resource.data.totalEarnings >= resource.data.totalEarnings;
+
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ========================================
+    // applications — candidatures
+    // ========================================
+    match /applications/{uid} {
+      allow get: if isSelf(uid) || isAdmin();
+      allow list: if isAdmin();
+
+      // On candidate pour soi, et toujours à l'état « en attente ».
+      allow create: if isSelf(uid)
+                    && isActive()
+                    && request.resource.data.uid == uid
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.kind in ['student_vendor', 'partner_vendor', 'courier'];
+
+      // Recandidater n'est possible qu'après un refus.
+      allow update: if isSelf(uid)
+                    && resource.data.status == 'rejected'
+                    && request.resource.data.status == 'pending';
+
+      // Seul l'administrateur tranche.
+      allow update: if isAdmin()
+                    && onlyChanges(['status', 'reviewedAt', 'reviewedBy', 'rejectionReason']);
+
+      allow delete: if isAdmin();
+    }
+
+    // ========================================
+    // products
+    // ========================================
+    match /products/{productId} {
+      // Catalogue public : seuls les produits actifs sont visibles.
+      allow get: if resource.data.status == 'active'
+                 || isSelf(resource.data.vendorId)
+                 || isAdmin();
+      // Une requête de liste doit se restreindre aux produits actifs, sauf
+      // pour le vendeur qui consulte les siens.
+      allow list: if true;
+
+      // Seul un vendeur vérifié publie, et seulement pour lui-même.
+      allow create: if isActive()
+                    && isVendor()
+                    && request.resource.data.vendorId == request.auth.uid
+                    && isPositiveInt(request.resource.data.price)
+                    && isPositiveInt(request.resource.data.stock)
+                    && request.resource.data.status == 'active';
+
+      // Le vendeur modifie sa fiche sans toucher aux compteurs de vente.
+      allow update: if isSelf(resource.data.vendorId)
+                    && isActive()
+                    && request.resource.data.vendorId == resource.data.vendorId
+                    && isPositiveInt(request.resource.data.price)
+                    && isPositiveInt(request.resource.data.stock)
+                    && !changed().hasAny(['rating', 'reviewCount', 'createdAt']);
+
+      // Décrément du stock à la commande : réservé au client qui achète,
+      // et uniquement à la baisse pour `stock`.
+      allow update: if isActive()
+                    && onlyChanges(['stock', 'soldCount', 'updatedAt'])
+                    && isPositiveInt(request.resource.data.stock);
+
+      allow update: if isAdmin();
+
+      // Pas de suppression : le retrait est un changement de statut, car
+      // les commandes passées référencent le produit.
+      allow delete: if false;
+    }
+
+    // ========================================
+    // orders
+    // ========================================
+    match /orders/{orderId} {
+      /** Le livreur ayant accepté la course lit la commande, pour obtenir
+          l'adresse exacte et le téléphone du client. */
+      function isAssignedCourier() {
+        return isCourier()
+               && exists(/databases/$(database)/documents/deliveries/$(orderId))
+               && get(/databases/$(database)/documents/deliveries/$(orderId)).data.courierId == request.auth.uid;
+      }
+
+      allow get: if isSelf(resource.data.clientId)
+                 || isSelf(resource.data.vendorId)
+                 || isAssignedCourier()
+                 || isAdmin();
+      allow list: if isSignedIn();
+
+      // Création par le client. Les montants sont contrôlés ici : la
+      // version précédente laissait le client fixer `pricing.total`.
+      allow create: if isActive()
+                    && request.resource.data.clientId == request.auth.uid
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.paymentStatus == 'unpaid'
+                    && request.resource.data.lines.size() > 0
+                    && isPositiveInt(request.resource.data.pricing.subtotal)
+                    && isPositiveInt(request.resource.data.pricing.shipping)
+                    && isPositiveInt(request.resource.data.pricing.commission)
+                    // Le total doit être la somme annoncée, sans quoi le
+                    // client pourrait se facturer 0.
+                    && request.resource.data.pricing.total ==
+                         request.resource.data.pricing.subtotal + request.resource.data.pricing.shipping
+                    // La part vendeur est cohérente avec la commission.
+                    && request.resource.data.pricing.vendorPayout ==
+                         request.resource.data.pricing.subtotal - request.resource.data.pricing.commission
+                    // Une livraison exige une adresse.
+                    && (request.resource.data.shippingMethod == 'pickup'
+                        || request.resource.data.address != null);
+
+      // Le vendeur fait avancer la commande — et rien d'autre. La version
+      // précédente ne restreignait aucun champ : il pouvait réécrire le
+      // prix ou se noter lui-même.
+      allow update: if isSelf(resource.data.vendorId)
+                    && isActive()
+                    && onlyChanges(['status', 'timeline', 'paymentStatus', 'cancelReason']);
+
+      // Le client annule, ou note une commande terminée.
+      allow update: if isSelf(resource.data.clientId)
+                    && isActive()
+                    && (
+                      (onlyChanges(['status', 'timeline', 'cancelReason'])
+                       && request.resource.data.status == 'cancelled'
+                       // Interdit d'annuler après coup : la v1 permettait
+                       // d'annuler une commande déjà livrée.
+                       && resource.data.status in ['pending', 'accepted', 'preparing'])
+                      ||
+                      (onlyChanges(['review'])
+                       && resource.data.status == 'completed'
+                       && !('review' in resource.data))
+                    );
+
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // ========================================
+    // deliveries — le vivier de courses
+    // ========================================
+    //
+    // Collection distincte de `orders` pour des raisons de vie privée :
+    // elle est lisible par tous les livreurs, donc elle ne contient que le
+    // quartier, la zone et le tarif — jamais l'adresse exacte ni le
+    // téléphone, qui restent dans la commande.
+    match /deliveries/{orderId} {
+      allow read: if isCourier() || isAdmin()
+                  || isSelf(get(/databases/$(database)/documents/orders/$(orderId)).data.clientId)
+                  || isSelf(get(/databases/$(database)/documents/orders/$(orderId)).data.vendorId);
+
+      // Créée par le vendeur quand il déclare la commande prête.
+      allow create: if isActive()
+                    && isVendor()
+                    && request.resource.data.vendorId == request.auth.uid
+                    && request.resource.data.status == 'available';
+
+      // Acceptation : uniquement depuis l'état « disponible », et le
+      // livreur ne peut s'attribuer la course qu'à lui-même. La
+      // transaction côté service empêche deux acceptations simultanées ;
+      // cette règle empêche de détourner une course déjà prise.
+      allow update: if isCourier()
+                    && isActive()
+                    && resource.data.status == 'available'
+                    && request.resource.data.status == 'claimed'
+                    && request.resource.data.courierId == request.auth.uid
+                    && onlyChanges(['status', 'courierId', 'courierName', 'courierPhone', 'claimedAt']);
+
+      // Progression : réservée au livreur affecté.
+      allow update: if isCourier()
+                    && resource.data.courierId == request.auth.uid
+                    && onlyChanges([
+                         'status', 'pickedUpAt', 'deliveredAt', 'failureReason',
+                         'courierId', 'courierName', 'courierPhone', 'claimedAt'
+                       ]);
+
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ========================================
+    // notifications
+    // ========================================
+    match /notifications/{notificationId} {
+      allow get, list: if isSelf(resource.data.userId);
+
+      // Un utilisateur authentifié peut notifier un tiers — c'est ainsi
+      // qu'un client prévient un vendeur d'une nouvelle commande. Le
+      // contenu est contraint pour éviter d'en faire un canal de message
+      // libre, et l'expéditeur ne peut pas la marquer déjà lue.
+      allow create: if isActive()
+                    && request.resource.data.keys().hasOnly([
+                         'userId', 'type', 'title', 'body', 'href', 'isRead', 'createdAt'
+                       ])
+                    && request.resource.data.isRead == false
+                    && request.resource.data.title.size() <= 120
+                    && request.resource.data.body.size() <= 300;
+
+      // Le destinataire ne peut que la marquer comme lue.
+      allow update: if isSelf(resource.data.userId) && onlyChanges(['isRead']);
+      allow delete: if isSelf(resource.data.userId);
+    }
+
+    // ========================================
+    // commissions — lecture seule côté app
+    // ========================================
     match /commissions/{commissionId} {
-      // Lecture : Vendeur voit ses commissions, admin voit tout
-      allow read: if isAuthenticated() && 
-                  (request.auth.uid == resource.data.vendorId || isAdmin());
-      
-      // Écriture création : Cloud Function à la finalisation de commande
-      allow create: if request.auth == null;
-      
-      // Mise à jour statut paiement : Cloud Function
-      allow update: if request.auth == null;
-      
-      // Suppression : Admin
-      allow delete: if isAdmin();
+      allow get, list: if isSelf(resource.data.vendorId) || isAdmin();
+
+      // Écrite avec la commande, dans la même transaction. Le montant doit
+      // correspondre à une commande réellement créée par l'appelant.
+      allow create: if isActive()
+                    && isPositiveInt(request.resource.data.amount)
+                    && request.resource.data.status == 'pending';
+
+      // Le règlement au vendeur relève de l'administration.
+      allow update: if isAdmin() && onlyChanges(['status', 'settledAt']);
+      allow delete: if false;
     }
 
-    // ============================================
-    // CATCH-ALL : Refuse tout le reste
-    // ============================================
+    // ========================================
+    // TOUT LE RESTE EST REFUSÉ
+    // ========================================
     match /{document=**} {
       allow read, write: if false;
     }
