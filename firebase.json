@@ -1,0 +1,57 @@
+{
+  "//": [
+    "Configuration Firebase CLI.",
+    "",
+    "Déploiement des règles et index :",
+    "  firebase deploy --only firestore:rules,firestore:indexes,storage",
+    "",
+    "Déploiement de la PWA (après npm run build:web) :",
+    "  firebase deploy --only hosting"
+  ],
+
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+
+  "storage": {
+    "rules": "storage.rules"
+  },
+
+  "hosting": {
+    "public": "dist",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "//": "expo-router fait du routage côté client : toute route inconnue doit rendre index.html, sinon un rechargement sur /cart renvoie un 404.",
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ],
+    "headers": [
+      {
+        "//": "Le service worker ne doit jamais être servi depuis le cache, sinon une ancienne version reste active après un déploiement.",
+        "source": "/sw.js",
+        "headers": [{ "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }]
+      },
+      {
+        "//": "Les bundles portent une empreinte dans leur nom : ils peuvent être mis en cache indéfiniment.",
+        "source": "/_expo/**",
+        "headers": [{ "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }]
+      },
+      {
+        "source": "**/*.@(png|jpg|jpeg|svg|webp|woff2)",
+        "headers": [{ "key": "Cache-Control", "value": "public, max-age=604800" }]
+      }
+    ]
+  },
+
+  "emulators": {
+    "//": "Permet de tester les règles et l'app sans toucher aux données de production : firebase emulators:start",
+    "auth": { "port": 9099 },
+    "firestore": { "port": 8082 },
+    "storage": { "port": 9199 },
+    "ui": { "enabled": true, "port": 4000 },
+    "singleProjectMode": true
+  }
+}
