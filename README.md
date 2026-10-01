@@ -67,6 +67,32 @@ Les index sont indispensables : sans eux, toute requête filtrée du catalogue �
 
 4. Pour créer le premier administrateur, passez manuellement `role` à `"admin"` sur son document dans `users` depuis la console Firebase.
 
+### Essayer les cinq rôles sans rien saisir
+
+Les émulateurs Firebase permettent de faire tourner l'application complète en local, sans projet ni données réelles :
+
+```bash
+npm run emulators
+```
+
+Puis, dans un second terminal :
+
+```bash
+npm run seed
+```
+
+Cela crée un compte par rôle, deux boutiques, huit produits, une candidature à valider et une commande en cours.
+
+| Rôle | Email |
+|---|---|
+| Client | `client@aubeshop.test` |
+| Vendeur étudiant | `etudiant@aubeshop.test` |
+| Vendeur partenaire | `partenaire@aubeshop.test` |
+| Livreur | `livreur@aubeshop.test` |
+| Admin | `admin@aubeshop.test` |
+
+Mot de passe commun : `aubeshop2026`. Ces comptes n'existent que dans l'émulateur.
+
 ---
 
 ## Scripts
@@ -80,6 +106,8 @@ npm run build:web   # export statique de la PWA dans dist/
 npm run serve:web   # servir la PWA construite sur localhost:8080
 npm run apk         # construire un APK Android installable
 npm run icons       # régénérer les icônes de marque
+npm run emulators   # émulateurs Firebase (Auth, Firestore, Storage)
+npm run seed        # jeu de données de démonstration dans les émulateurs
 npm run typecheck   # vérification TypeScript
 npm run lint        # linter
 ```

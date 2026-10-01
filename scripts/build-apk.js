@@ -90,6 +90,11 @@ kotlin.incremental=true
 android.useAndroidX=true
 android.enableJetifier=false
 
+# Java 21 est installé localement : inutile que Gradle aille en télécharger
+# un autre. Évite une résolution réseau supplémentaire au démarrage.
+org.gradle.java.installations.auto-download=false
+org.gradle.java.installations.auto-detect=true
+
 # Une seule architecture par APK réduirait la taille, mais un APK
 # universel s'installe sur n'importe quel téléphone — c'est ce qu'on veut
 # pour une distribution directe.

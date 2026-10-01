@@ -13,6 +13,8 @@
     "icons": "node scripts/generate-icons.js",
     "typecheck": "tsc --noEmit",
     "lint": "expo lint",
+    "emulators": "firebase emulators:start",
+    "seed": "node scripts/seed.js",
     "apk": "cross-env NODE_OPTIONS=--max-old-space-size=4096 node scripts/build-apk.js",
     "reset-project": "node ./scripts/reset-project.js"
   },
@@ -53,6 +55,7 @@
     "cross-env": "^10.1.0",
     "eslint": "^9.25.0",
     "eslint-config-expo": "~10.0.0",
+    "firebase-admin": "^14.5.0",
     "typescript": "~5.9.2"
   },
   "private": true
