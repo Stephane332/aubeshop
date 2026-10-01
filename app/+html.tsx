@@ -73,10 +73,13 @@ const BASE_STYLE = `
   :root { color-scheme: light dark; }
 
   /*
-    React Native Web traduit « flex: 1 » en hauteur relative au parent.
-    Sans hauteur explicite sur la chaîne html > body > #root, la racine
-    se dimensionne sur son contenu : la barre d'onglets se retrouve au
-    milieu de la page au lieu d'être collée en bas.
+    React Native Web traduit « flex: 1 » en hauteur relative au parent :
+    la chaîne html > body > #root doit donc avoir une hauteur explicite,
+    sans quoi la racine se dimensionne sur son contenu et les éléments
+    ancrés en bas, comme la barre d'onglets, remontent.
+
+    Expo pose déjà cette hauteur ; on la fixe ici par sécurité, pour ne
+    pas dépendre d'un détail d'implémentation du gabarit.
   */
   html, body, #root {
     height: 100%;
