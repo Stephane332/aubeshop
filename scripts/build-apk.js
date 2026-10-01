@@ -51,6 +51,55 @@ if (!fs.existsSync(sdk)) {
 }
 console.log(`SDK Android : ${sdk}`);
 
+/**
+ * Nettoie les NDK à moitié installés.
+ *
+ * Un téléchargement interrompu (disque plein, coupure réseau) laisse un
+ * dossier ne contenant qu'un marqueur `.installer`. Gradle le prend pour
+ * une installation valide, puis échoue sur
+ * « Failed to install the following SDK components » sans expliquer
+ * pourquoi. On supprime ces coquilles pour que le SDK les réinstalle.
+ */
+function cleanBrokenNdks() {
+  const ndkRoot = path.join(sdk, 'ndk');
+  if (!fs.existsSync(ndkRoot)) return;
+
+  for (const name of fs.readdirSync(ndkRoot)) {
+    const dir = path.join(ndkRoot, name);
+    if (!fs.statSync(dir).isDirectory()) continue;
+
+    // `source.properties` n'est écrit qu'à la fin d'une installation réussie.
+    if (!fs.existsSync(path.join(dir, 'source.properties'))) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      console.log(`NDK incomplet supprimé : ${name}`);
+    }
+  }
+}
+
+cleanBrokenNdks();
+
+// Une compilation Android produit plusieurs gigaoctets d'intermédiaires,
+// en plus du NDK à télécharger le cas échéant.
+const freeGB = (() => {
+  try {
+    return fs.statfsSync(ROOT).bavail * fs.statfsSync(ROOT).bsize / 1024 ** 3;
+  } catch {
+    return null;
+  }
+})();
+
+if (freeGB !== null) {
+  console.log(`Espace disque libre : ${freeGB.toFixed(1)} Go`);
+  if (freeGB < 6) {
+    console.warn(
+      '\nAttention : moins de 6 Go libres. Une compilation Android en demande\n' +
+        'facilement autant entre le NDK et les fichiers intermédiaires.\n' +
+        'Pistes : « npm cache clean --force », ou compiler dans le cloud avec\n' +
+        '« npx eas build -p android --profile preview ».\n'
+    );
+  }
+}
+
 // ============================================
 // 2. GÉNÉRATION DU PROJET NATIF
 // ============================================

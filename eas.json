@@ -1,0 +1,59 @@
+{
+  "//": [
+    "Profils de compilation EAS (build dans le cloud Expo).",
+    "",
+    "Utile ici parce qu'une compilation Android locale demande le NDK",
+    "(~2,5 Go), plusieurs gigaoctets d'intermédiaires et beaucoup de RAM.",
+    "EAS compile sur des machines dédiées : rien à installer en local.",
+    "",
+    "  npx eas login          (compte Expo, création gratuite)",
+    "  npx eas build -p android --profile preview",
+    "",
+    "Le profil « preview » produit un APK directement installable.",
+    "Le profil « production » produit un AAB, format exigé par le Play Store."
+  ],
+
+  "cli": {
+    "version": ">= 12.0.0",
+    "appVersionSource": "remote"
+  },
+
+  "build": {
+    "development": {
+      "//": "Build de développement : inclut le client de rechargement à chaud.",
+      "developmentClient": true,
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      }
+    },
+
+    "preview": {
+      "//": "APK installable directement, à partager hors Play Store.",
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_COMMISSION_RATE": "0.10",
+        "EXPO_PUBLIC_SHIPPING_COST": "500"
+      }
+    },
+
+    "production": {
+      "//": "AAB signé, pour une publication sur le Play Store.",
+      "autoIncrement": true,
+      "android": {
+        "buildType": "app-bundle"
+      },
+      "env": {
+        "EXPO_PUBLIC_COMMISSION_RATE": "0.10",
+        "EXPO_PUBLIC_SHIPPING_COST": "500"
+      }
+    }
+  },
+
+  "submit": {
+    "production": {}
+  }
+}

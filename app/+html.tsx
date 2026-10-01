@@ -71,10 +71,30 @@ export default function Root({ children }: PropsWithChildren) {
  */
 const BASE_STYLE = `
   :root { color-scheme: light dark; }
-  body { background-color: #F6F6F8; overscroll-behavior-y: none; }
+
+  /*
+    React Native Web traduit « flex: 1 » en hauteur relative au parent.
+    Sans hauteur explicite sur la chaîne html > body > #root, la racine
+    se dimensionne sur son contenu : la barre d'onglets se retrouve au
+    milieu de la page au lieu d'être collée en bas.
+  */
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+  }
+  #root {
+    display: flex;
+    flex-direction: column;
+  }
+
+  body {
+    background-color: #F6F6F8;
+    overscroll-behavior-y: none;
+  }
   @media (prefers-color-scheme: dark) {
     body { background-color: #0D0D10; }
   }
+
   /* Supprime le surlignage bleu au tap sur mobile. */
   * { -webkit-tap-highlight-color: transparent; }
 `;

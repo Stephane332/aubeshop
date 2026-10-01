@@ -55,18 +55,16 @@ export function SetupBanner() {
 
   return (
     <>
+      {/* Dans le flux, pas en superposition : un bandeau absolu masquait
+          le titre de l'écran en dessous. */}
       <View
         style={{
-          position: 'absolute',
-          top: insets.top,
-          left: 0,
-          right: 0,
-          zIndex: 900,
           flexDirection: 'row',
           alignItems: 'center',
           gap: t.spacing.sm,
           paddingHorizontal: t.spacing.md,
-          paddingVertical: t.spacing.sm,
+          paddingTop: insets.top + t.spacing.sm,
+          paddingBottom: t.spacing.sm,
           backgroundColor: t.colors.warning,
         }}>
         <Ionicons name="warning-outline" size={16} color="#FFFFFF" />

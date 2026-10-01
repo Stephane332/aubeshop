@@ -111,10 +111,14 @@ function Navigation() {
   return (
     <ThemeProvider value={navTheme}>
       <View style={{ flex: 1, backgroundColor: t.colors.background }}>
-        <Gate />
         {/* Sans projet Firebase relié, l'app reste navigable : on prévient
-            par un bandeau plutôt que de bloquer sur une page blanche. */}
+            par un bandeau plutôt que de bloquer sur une page blanche.
+            Placé avant la pile pour occuper sa propre hauteur au lieu de
+            recouvrir l'écran. */}
         {!isFirebaseConfigured && <SetupBanner />}
+        <View style={{ flex: 1 }}>
+          <Gate />
+        </View>
       </View>
       <StatusBar style={t.isDark ? 'light' : 'dark'} />
     </ThemeProvider>
